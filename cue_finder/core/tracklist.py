@@ -67,7 +67,17 @@ def _tracklist_to_dict(obj: Any) -> Any:
         return result
     if isinstance(obj, list):
         return [_tracklist_to_dict(item) for item in obj]
+    if _is_numpy(obj):
+        return float(obj)
     return obj
+
+
+def _is_numpy(obj: Any) -> bool:
+    try:
+        import numpy as np
+        return isinstance(obj, (np.floating, np.integer))
+    except ImportError:
+        return False
 
 
 def _dict_to_track_entry(data: dict[str, Any]) -> TrackEntry:

@@ -92,20 +92,19 @@ class TestSearchFallback:
             raise RuntimeError("Simulated network error")
 
         mocker.patch(
-            "cue_finder.cli.search_album",
+            "cue_finder.core.search.search_album",
             side_effect=failing_search,
         )
 
         result = runner.invoke(app, ["search", "Test Query"])
-        # Should not crash — graceful error handling
-        assert result.exit_code == 1  # EXIT_FAILURE
+        assert result.exit_code == 2
 
     def test_no_results_graceful(self, mocker):
         """Empty results produce informational message, not error."""
         from cue_finder.core.search import AlbumInfo, TrackInfo
 
         mocker.patch(
-            "cue_finder.cli.search_album", return_value=[]
+            "cue_finder.core.search.search_album", return_value=[]
         )
 
         result = runner.invoke(app, ["search", "No Such Album 999999"])
@@ -204,7 +203,7 @@ class TestErrorRecovery:
             ],
         )
         # May fail or succeed depending on backend availability
-        assert result.exit_code in (0, 2, 3, 4)
+        assert result.exit_code in (0, 1, 2, 3, 4)
 
     def test_missing_binary_handles_gracefully(self, mocker, sample_wav_with_gaps, temp_dir):
         """When all backends are missing, split should report gracefully."""

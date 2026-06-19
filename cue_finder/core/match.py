@@ -162,16 +162,13 @@ class TrackMatcher:
 
         matches.reverse()
 
-        # Handle extra segments (N > M)
-        extra_flags: list[str] = []
+        # Handle extra segments (N > M) or missing tracks (N < M)
         if n > m:
-            extra_flags.append("extra_segment")
-        elif n < m:
-            extra_flags.append("missing_track")
-
-        if extra_flags:
             for match in matches:
-                match.flags.extend(extra_flags)
+                match.flags.append("extra_segment")
+        elif n < m:
+            for match in matches:
+                match.flags.append("missing_track")
 
         # Segment count bonus/penalty
         count_penalty = abs(n - m) * 0.1
@@ -190,6 +187,7 @@ class TrackMatcher:
         n = len(boundaries) + 1
         actual_starts = [0.0] + list(boundaries)
         actual_ends = list(boundaries) + [total_duration]
+        m = len(expected_starts)
 
         matches: list[TrackMatch] = []
         for j, expected_start in enumerate(expected_starts):
@@ -222,6 +220,13 @@ class TrackMatcher:
                     flags=[],
                 )
             )
+
+        if n > m:
+            for match in matches:
+                match.flags.append("extra_segment")
+        elif n < m:
+            for match in matches:
+                match.flags.append("missing_track")
 
         return matches
 

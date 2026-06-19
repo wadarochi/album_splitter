@@ -74,7 +74,7 @@ class TestCueGeneration:
             album_artist="Test Artist",
             album_title="Test Album",
             audio_filename="test.flac",
-            tracks=tracks,
+            matched_tracks=tracks,
         )
 
         assert 'PERFORMER "Test Artist"' in cue_text
@@ -92,7 +92,7 @@ class TestCueGeneration:
             album_artist="A",
             album_title="B",
             audio_filename=r"F:\music\album.flac",
-            tracks=tracks,
+            matched_tracks=tracks,
         )
 
         assert 'FILE "album.flac" WAVE' in cue_text
@@ -103,7 +103,7 @@ class TestCueGeneration:
             album_artist="A",
             album_title="B",
             audio_filename="test.flac",
-            tracks=tracks,
+            matched_tracks=tracks,
             rem_fields={"DATE": "2004", "GENRE": "Pop"},
         )
 
@@ -112,7 +112,8 @@ class TestCueGeneration:
 
 
 class TestCueParsing:
-    def test_parse_valid_cue(self):
+    def test_parse_valid_cue(self, temp_dir):
+        import tempfile as _tmp
         cue_text = """PERFORMER "Test Artist"
 TITLE "Test Album"
 FILE "test.flac" WAVE
@@ -123,7 +124,9 @@ FILE "test.flac" WAVE
     TITLE "Track 2"
     INDEX 01 03:30:00
 """
-        sheet = parse_cue(cue_text)
+        cue_path = temp_dir / "test.cue"
+        cue_path.write_text(cue_text, encoding="utf-8-sig")
+        sheet = parse_cue(cue_path)
 
         assert sheet.performer == "Test Artist"
         assert sheet.title == "Test Album"
@@ -134,7 +137,7 @@ FILE "test.flac" WAVE
         assert sheet.tracks[1].title == "Track 2"
         assert sheet.tracks[1].index01 == "03:30:00"
 
-    def test_parse_cue_with_rem(self):
+    def test_parse_cue_with_rem(self, temp_dir):
         cue_text = """REM DATE "2004"
 REM GENRE "Pop"
 PERFORMER "Artist"
@@ -144,7 +147,9 @@ FILE "test.flac" WAVE
     TITLE "Track"
     INDEX 01 00:00:00
 """
-        sheet = parse_cue(cue_text)
+        cue_path = temp_dir / "test_rem.cue"
+        cue_path.write_text(cue_text, encoding="utf-8-sig")
+        sheet = parse_cue(cue_path)
 
         assert sheet.rem_fields.get("DATE") == "2004"
         assert sheet.rem_fields.get("GENRE") == "Pop"
@@ -205,7 +210,7 @@ FILE "test.flac" WAVE
 
 
 class TestCueWriteRead:
-    def test_write_and_read_roundtrip(self):
+    def test_write_and_read_roundtrip(self, temp_dir):
         tracks = [
             CueTrack(1, "Track 1", "", "00:00:00", 0.0),
             CueTrack(2, "Track 2", "", "03:30:00", 210.0),
@@ -214,22 +219,16 @@ class TestCueWriteRead:
             album_artist="Test Artist",
             album_title="Test Album",
             audio_filename="output.flac",
-            tracks=tracks,
+            matched_tracks=tracks,
         )
 
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".cue", delete=False, encoding="utf-8-sig"
-        ) as f:
-            write_cue(cue_text, f.name)
-            cue_path = f.name
+        cue_path = temp_dir / "roundtrip.cue"
+        cue_path.write_text(cue_text, encoding="utf-8-sig")
 
-        try:
-            sheet = parse_cue(Path(cue_path))
-            assert sheet.performer == "Test Artist"
-            assert sheet.title == "Test Album"
-            assert len(sheet.tracks) == 2
-        finally:
-            Path(cue_path).unlink(missing_ok=True)
+        sheet = parse_cue(cue_path)
+        assert sheet.performer == "Test Artist"
+        assert sheet.title == "Test Album"
+        assert len(sheet.tracks) == 2
 
 
 class TestMultiDisc:
@@ -246,8 +245,8 @@ class TestMultiDisc:
         ]
 
         discs = [
-            {"file": "disc1.flac", "tracks": disc1_tracks, "performer": "Artist", "title": "Album (Disc 1)"},
-            {"file": "disc2.flac", "tracks": disc2_tracks, "performer": "Artist", "title": "Album (Disc 2)"},
+            {"audio_filename": "disc1.flac", "tracks": disc1_tracks, "album_artist": "Artist", "album_title": "Album (Disc 1)"},
+            {"audio_filename": "disc2.flac", "tracks": disc2_tracks, "album_artist": "Artist", "album_title": "Album (Disc 2)"},
         ]
 
         cue_text = generate_cue_multidisc(discs)

@@ -253,7 +253,7 @@ def generate(
         album_artist=album_artist,
         album_title=album_title,
         audio_filename=input_path.name,
-        tracks=cue_tracks,
+        matched_tracks=cue_tracks,
     )
     write_cue(cue_text, output)
     console.print(f"[green]CUE sheet written to {output}[/green]")
@@ -285,7 +285,7 @@ def split(
             raise typer.Exit(EXIT_INVALID_ARGS)
 
     splitter = Splitter()
-    splitter.report_backends(console)
+    splitter.report_backends()
 
     with Progress(
         SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
@@ -460,7 +460,7 @@ def run(
         album_artist=album_artist,
         album_title=album_title,
         audio_filename=input_path.name,
-        tracks=cue_tracks,
+        matched_tracks=cue_tracks,
     )
     write_cue(cue_text, str(cue_path))
     console.print(f"  Wrote CUE: {cue_path}")
