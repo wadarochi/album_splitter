@@ -1,0 +1,847 @@
+"""Multi-source metadata search module with cascading fallback."""
+
+from __future__ import annotations
+
+import importlib
+import os
+import re
+import time
+import urllib.parse
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+import requests
+
+musicbrainzngs: Any = None
+try:
+    musicbrainzngs = importlib.import_module("musicbrainzngs")
+except Exception:
+    pass
+
+discogs_client: Any = None
+try:
+    discogs_client = importlib.import_module("discogs_client")
+except Exception:
+    pass
+
+deezer: Any = None
+try:
+    deezer = importlib.import_module("deezer")
+except Exception:
+    pass
+
+pyncm: Any = None
+try:
+    pyncm = importlib.import_module("pyncm")
+    _ = importlib.import_module("pyncm.apis.album")
+    _ = importlib.import_module("pyncm.apis.cloudsearch")
+except Exception:
+    pass
+
+pyacoustid: Any = None
+try:
+    pyacoustid = importlib.import_module("pyacoustid")
+except Exception:
+    pass
+
+
+@dataclass
+class TrackInfo:
+    """Normalized track representation."""
+
+    title: str
+    duration_sec: float | None
+    artist: str | None = None
+
+
+@dataclass
+class AlbumInfo:
+    """Normalized album representation."""
+
+    artist: str
+    title: str
+    date: str | None
+    source: str
+    source_id: str
+    tracks: list[TrackInfo] = field(default_factory=list)
+
+
+DEFAULT_SOURCES = (
+    "musicbrainz",
+    "itunes",
+    "netease",
+    "discogs",
+    "deezer",
+    "gnudb",
+)
+
+_SOURCE_DELAYS = {
+    "musicbrainz": 1.0,
+    "itunes": 0.2,
+    "netease": 0.2,
+    "discogs": 1.0,
+    "deezer": 0.2,
+    "gnudb": 1.0,
+    "acoustid": 0.5,
+}
+
+_last_request_time: dict[str, float] = {}
+
+
+def _rate_limit(source: str) -> None:
+    delay = _SOURCE_DELAYS.get(source, 0.0)
+    if delay <= 0:
+        return
+    last = _last_request_time.get(source, 0.0)
+    elapsed = time.monotonic() - last
+    if elapsed < delay:
+        time.sleep(delay - elapsed)
+    _last_request_time[source] = time.monotonic()
+
+
+def _retry_with_backoff(
+    source: str, max_retries: int = 3
+) -> Callable[[Callable[[], Any]], Any]:
+    def _retry(func: Callable[[], Any]) -> Any:
+        for attempt in range(max_retries + 1):
+            try:
+                _rate_limit(source)
+                return func()
+            except Exception as exc:
+                if attempt >= max_retries:
+                    raise
+                message = str(exc).lower()
+                status_code = getattr(exc, "status_code", None) or getattr(
+                    exc, "code", None
+                )
+                if status_code in (429, 503) or "rate" in message or "503" in message:
+                    time.sleep(2**attempt)
+                    continue
+                raise
+        return None
+
+    return _retry
+
+
+def _safe_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_duration_string(value: str | None) -> float | None:
+    if not value:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    parts = value.split(":")
+    try:
+        numeric_parts = [float(part) for part in parts]
+    except ValueError:
+        return None
+    if not numeric_parts:
+        return None
+    total = 0.0
+    for part in numeric_parts:
+        total = total * 60 + part
+    return total
+
+
+def _check_source_available(name: str) -> bool:
+    if name == "musicbrainz":
+        return musicbrainzngs is not None
+    if name == "itunes":
+        return True
+    if name == "netease":
+        return pyncm is not None
+    if name == "discogs":
+        return discogs_client is not None and bool(os.environ.get("DISCOGS_TOKEN"))
+    if name == "deezer":
+        return deezer is not None
+    if name == "gnudb":
+        return True
+    if name == "acoustid":
+        return pyacoustid is not None and bool(os.environ.get("ACOUSTID_API_KEY"))
+    return False
+
+
+def _musicbrainz_search(query: str) -> list[AlbumInfo]:
+    if musicbrainzngs is None:
+        return []
+    musicbrainzngs.set_useragent("cue-finder", "0.1")
+
+    def _do_search() -> dict[str, Any]:
+        return musicbrainzngs.search_releases(query=query, limit=10)
+
+    try:
+        result = _retry_with_backoff("musicbrainz")(_do_search)
+    except Exception:
+        return []
+
+    releases = result.get("release-list", []) if result else []
+    albums: list[AlbumInfo] = []
+    for release in releases:
+        release_id = release.get("id")
+        if not release_id:
+            continue
+        album = _musicbrainz_fetch(release_id)
+        if album and album.tracks and all(t.duration_sec is not None for t in album.tracks):
+            albums.append(album)
+    return albums
+
+
+def _musicbrainz_fetch(release_id: str) -> AlbumInfo | None:
+    if musicbrainzngs is None:
+        return None
+    musicbrainzngs.set_useragent("cue-finder", "0.1")
+
+    def _do_fetch() -> dict[str, Any]:
+        return musicbrainzngs.get_release_by_id(
+            release_id, includes=["recordings", "media"]
+        )
+
+    try:
+        result = _retry_with_backoff("musicbrainz")(_do_fetch)
+    except Exception:
+        return None
+
+    release = result.get("release", {}) if result else {}
+    artist = _musicbrainz_artist_name(release.get("artist-credit", []))
+    title = release.get("title", "")
+    date = release.get("date") or None
+    tracks: list[TrackInfo] = []
+    for medium in release.get("medium-list", []):
+        for track in medium.get("track-list", []):
+            recording = track.get("recording", {})
+            track_title = recording.get("title") or track.get("title", "")
+            length_ms = recording.get("length")
+            duration = None
+            if length_ms is not None:
+                duration = _safe_float(length_ms)
+                if duration is not None:
+                    duration = duration / 1000.0
+            track_artist = _musicbrainz_artist_name(track.get("artist-credit", [])) or artist
+            tracks.append(TrackInfo(title=track_title, duration_sec=duration, artist=track_artist))
+    return AlbumInfo(
+        artist=artist,
+        title=title,
+        date=date,
+        source="musicbrainz",
+        source_id=release_id,
+        tracks=tracks,
+    )
+
+
+def _musicbrainz_artist_name(artist_credit: list[dict[str, Any]]) -> str:
+    if not artist_credit:
+        return ""
+    parts: list[str] = []
+    for item in artist_credit:
+        artist = item.get("artist", {})
+        name = artist.get("name", "")
+        if name:
+            parts.append(name)
+        join_phrase = item.get("joinphrase", "")
+        if join_phrase:
+            parts.append(join_phrase.strip())
+    return " ".join(parts).strip()
+
+
+def _itunes_search(query: str) -> list[AlbumInfo]:
+    url = "https://itunes.apple.com/search"
+    params = {
+        "term": query,
+        "entity": "album",
+        "limit": "10",
+    }
+
+    def _do_search() -> dict[str, Any]:
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        return response.json()
+
+    try:
+        result = _retry_with_backoff("itunes")(_do_search)
+    except Exception:
+        return []
+
+    albums: list[AlbumInfo] = []
+    for album in result.get("results", []):
+        collection_id = album.get("collectionId")
+        if not collection_id:
+            continue
+        fetched = _itunes_fetch(collection_id)
+        if fetched and fetched.tracks and all(t.duration_sec is not None for t in fetched.tracks):
+            albums.append(fetched)
+    return albums
+
+
+def _itunes_fetch(album_id: int | str) -> AlbumInfo | None:
+    url = "https://itunes.apple.com/lookup"
+    params = {"id": str(album_id), "entity": "song"}
+
+    def _do_fetch() -> dict[str, Any]:
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        return response.json()
+
+    try:
+        result = _retry_with_backoff("itunes")(_do_fetch)
+    except Exception:
+        return None
+
+    album_data: dict[str, Any] | None = None
+    tracks: list[TrackInfo] = []
+    for item in result.get("results", []):
+        if item.get("wrapperType") == "collection" and item.get("collectionType") == "Album":
+            album_data = item
+        elif item.get("wrapperType") == "track" and item.get("kind") == "song":
+            duration_ms = item.get("trackTimeMillis")
+            duration = None
+            if duration_ms is not None:
+                duration = _safe_float(duration_ms)
+                if duration is not None:
+                    duration = duration / 1000.0
+            tracks.append(
+                TrackInfo(
+                    title=item.get("trackName", ""),
+                    duration_sec=duration,
+                    artist=item.get("artistName"),
+                )
+            )
+
+    if album_data is None:
+        return None
+
+    tracks = sorted(tracks, key=lambda t: t.duration_sec or 0.0)
+    artist = album_data.get("artistName", "")
+    title = album_data.get("collectionName", "")
+    release_date = album_data.get("releaseDate", "")[:10] or None
+    return AlbumInfo(
+        artist=artist,
+        title=title,
+        date=release_date,
+        source="itunes",
+        source_id=str(album_id),
+        tracks=tracks,
+    )
+
+
+def _netease_search(query: str) -> list[AlbumInfo]:
+    if pyncm is None:
+        return []
+
+    def _do_search() -> dict[str, Any]:
+        return pyncm.apis.cloudsearch.GetSearchResult(query, type=10, limit=10)
+
+    try:
+        result = _retry_with_backoff("netease")(_do_search)
+    except Exception:
+        return []
+
+    albums: list[AlbumInfo] = []
+    search_result = result.get("result", {}) if result else {}
+    for album in search_result.get("albums", []):
+        album_id = album.get("id")
+        if not album_id:
+            continue
+        fetched = _netease_fetch(album_id)
+        if fetched and fetched.tracks and all(t.duration_sec is not None for t in fetched.tracks):
+            albums.append(fetched)
+    return albums
+
+
+def _netease_fetch(album_id: int | str) -> AlbumInfo | None:
+    if pyncm is None:
+        return None
+
+    def _do_fetch() -> dict[str, Any]:
+        return pyncm.apis.album.GetAlbumInfo(album_id)
+
+    try:
+        result = _retry_with_backoff("netease")(_do_fetch)
+    except Exception:
+        return None
+
+    album = result.get("album", {}) if result else {}
+    songs = result.get("songs", []) if result else []
+    artist = _netease_artist_name(album.get("artist", {}))
+    title = album.get("name", "")
+    publish_time = album.get("publishTime")
+    date = None
+    if publish_time:
+        try:
+            date = time.strftime("%Y-%m-%d", time.localtime(publish_time / 1000))
+        except Exception:
+            date = str(publish_time)
+
+    tracks: list[TrackInfo] = []
+    for song in songs:
+        duration_ms = song.get("dt")
+        duration = None
+        if duration_ms is not None:
+            duration = _safe_float(duration_ms)
+            if duration is not None:
+                duration = duration / 1000.0
+        track_artist = _netease_artist_name(song.get("ar", []))
+        tracks.append(
+            TrackInfo(
+                title=song.get("name", ""),
+                duration_sec=duration,
+                artist=track_artist,
+            )
+        )
+    return AlbumInfo(
+        artist=artist,
+        title=title,
+        date=date,
+        source="netease",
+        source_id=str(album_id),
+        tracks=tracks,
+    )
+
+
+def _netease_artist_name(artist_data: Any) -> str:
+    if isinstance(artist_data, dict):
+        return artist_data.get("name", "")
+    if isinstance(artist_data, list) and artist_data:
+        names = [a.get("name", "") for a in artist_data if isinstance(a, dict)]
+        return ", ".join(name for name in names if name)
+    return ""
+
+
+def _discogs_search(query: str) -> list[AlbumInfo]:
+    token = os.environ.get("DISCOGS_TOKEN")
+    if discogs_client is None or not token:
+        return []
+    client = discogs_client.Client("cue-finder/0.1", user_token=token)
+
+    def _do_search() -> list[Any]:
+        return list(client.search(query, type="release"))
+
+    try:
+        results = _retry_with_backoff("discogs")(_do_search)
+    except Exception:
+        return []
+
+    albums: list[AlbumInfo] = []
+    for release in results[:10]:
+        try:
+            release_id = release.id
+        except Exception:
+            continue
+        album = _discogs_fetch(str(release_id))
+        if album and album.tracks and all(t.duration_sec is not None for t in album.tracks):
+            albums.append(album)
+    return albums
+
+
+def _discogs_fetch(release_id: str) -> AlbumInfo | None:
+    token = os.environ.get("DISCOGS_TOKEN")
+    if not token or discogs_client is None:
+        return None
+    client = discogs_client.Client("cue-finder/0.1", user_token=token)
+
+    def _do_fetch() -> Any:
+        return client.release(int(release_id))
+
+    try:
+        release = _retry_with_backoff("discogs")(_do_fetch)
+    except Exception:
+        return None
+
+    try:
+        release.refresh()
+    except Exception:
+        pass
+
+    artist_parts = []
+    try:
+        artists = release.artists
+    except Exception:
+        artists = []
+    for artist in artists:
+        try:
+            artist_parts.append(artist.name)
+        except Exception:
+            continue
+    artist = ", ".join(artist_parts)
+
+    title = ""
+    try:
+        title = release.title
+    except Exception:
+        pass
+
+    year = None
+    try:
+        year = str(release.year) if release.year else None
+    except Exception:
+        pass
+
+    tracks: list[TrackInfo] = []
+    try:
+        tracklist = release.tracklist
+    except Exception:
+        tracklist = []
+    for track in tracklist:
+        try:
+            track_title = track.title
+        except Exception:
+            track_title = ""
+        duration = _parse_duration_string(getattr(track, "duration", None))
+        track_artist = artist
+        try:
+            track_artists = track.artists
+            if track_artists:
+                track_artist = ", ".join(a.name for a in track_artists)
+        except Exception:
+            pass
+        tracks.append(TrackInfo(title=track_title, duration_sec=duration, artist=track_artist))
+
+    if not tracks or any(t.duration_sec is None for t in tracks):
+        return None
+
+    return AlbumInfo(
+        artist=artist,
+        title=title,
+        date=year,
+        source="discogs",
+        source_id=release_id,
+        tracks=tracks,
+    )
+
+
+def _deezer_search(query: str) -> list[AlbumInfo]:
+    if deezer is None:
+        return []
+    client = deezer.Client()
+
+    def _do_search() -> list[Any]:
+        return client.search_albums(query)
+
+    try:
+        results = _retry_with_backoff("deezer")(_do_search)
+    except Exception:
+        return []
+
+    albums: list[AlbumInfo] = []
+    for album in results[:10]:
+        try:
+            album_id = album.id
+        except Exception:
+            continue
+        fetched = _deezer_fetch(str(album_id))
+        if fetched and fetched.tracks and all(t.duration_sec is not None for t in fetched.tracks):
+            albums.append(fetched)
+    return albums
+
+
+def _deezer_fetch(album_id: str) -> AlbumInfo | None:
+    if deezer is None:
+        return None
+    client = deezer.Client()
+
+    def _do_get_album() -> Any:
+        return client.get_album(int(album_id))
+
+    try:
+        album = _retry_with_backoff("deezer")(_do_get_album)
+    except Exception:
+        return None
+
+    try:
+        artist = album.artist.name if album.artist else ""
+    except Exception:
+        artist = ""
+    try:
+        title = album.title or ""
+    except Exception:
+        title = ""
+    try:
+        release_date = album.release_date or None
+    except Exception:
+        release_date = None
+
+    tracks: list[TrackInfo] = []
+    try:
+        album_tracks = album.get_tracks()
+    except Exception:
+        album_tracks = []
+    for track in album_tracks:
+        try:
+            track_title = track.title or ""
+        except Exception:
+            track_title = ""
+        try:
+            track_artist = track.artist.name if track.artist else artist
+        except Exception:
+            track_artist = artist
+        try:
+            duration = float(track.duration) if track.duration is not None else None
+        except Exception:
+            duration = None
+        tracks.append(TrackInfo(title=track_title, duration_sec=duration, artist=track_artist))
+
+    return AlbumInfo(
+        artist=artist,
+        title=title,
+        date=release_date,
+        source="deezer",
+        source_id=album_id,
+        tracks=tracks,
+    )
+
+
+def _gnudb_search(query: str) -> list[AlbumInfo]:
+    encoded_query = urllib.parse.quote_plus(query)
+    url = (
+        f"http://gnudb.gnudb.org/~cddb/cddb.cgi?cmd=cddb+query+{encoded_query}"
+        f"&hello=cuefinder@localhost+cue-finder+0.1&proto=6"
+    )
+
+    def _do_search() -> str:
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        return response.text
+
+    try:
+        text = _retry_with_backoff("gnudb")(_do_search)
+    except Exception:
+        return []
+
+    albums: list[AlbumInfo] = []
+    for line in text.splitlines():
+        if line.startswith("200"):
+            parts = line.split(" ", 3)
+            if len(parts) >= 4:
+                discid = parts[1]
+                album = _gnudb_fetch(discid)
+                if album and album.tracks and all(t.duration_sec is not None for t in album.tracks):
+                    albums.append(album)
+                    break
+        elif line.startswith("211") or line.startswith("210"):
+            continue
+        elif re.match(r"^[0-9a-zA-Z]+\s+", line):
+            parts = line.split(" ", 2)
+            if len(parts) >= 3:
+                discid = parts[1]
+                album = _gnudb_fetch(discid)
+                if album and album.tracks and all(t.duration_sec is not None for t in album.tracks):
+                    albums.append(album)
+    return albums[:10]
+
+
+def _gnudb_fetch(discid: str) -> AlbumInfo | None:
+    url = (
+        f"http://gnudb.gnudb.org/~cddb/cddb.cgi?cmd=cddb+read+misc+{discid}"
+        f"&hello=cuefinder@localhost+cue-finder+0.1&proto=6"
+    )
+
+    def _do_fetch() -> str:
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        return response.text
+
+    try:
+        text = _retry_with_backoff("gnudb")(_do_fetch)
+    except Exception:
+        return None
+
+    if not text.startswith("210") and not text.startswith("200"):
+        return None
+
+    dtitle = ""
+    dyear: str | None = None
+    offsets: list[int] = []
+    tracks: list[TrackInfo] = []
+    for line in text.splitlines()[1:]:
+        if line.startswith("DTITLE="):
+            dtitle = line.split("=", 1)[1].strip()
+        elif line.startswith("DYEAR="):
+            dyear = line.split("=", 1)[1].strip() or None
+        elif line.startswith("TTITLE"):
+            idx_title = line.split("=", 1)
+            if len(idx_title) == 2:
+                tracks.append(TrackInfo(title=idx_title[1].strip(), duration_sec=None, artist=None))
+        elif re.match(r"^\d+\s", line):
+            try:
+                offsets.append(int(line.split()[0]))
+            except ValueError:
+                pass
+
+    if len(tracks) > 1 and len(offsets) == len(tracks):
+        for i in range(len(tracks) - 1):
+            duration_frames = offsets[i + 1] - offsets[i]
+            tracks[i].duration_sec = duration_frames / 75.0
+
+    if not tracks or all(t.duration_sec is None for t in tracks):
+        return None
+
+    artist = ""
+    title = dtitle
+    if " / " in dtitle:
+        artist, title = dtitle.split(" / ", 1)
+    return AlbumInfo(
+        artist=artist,
+        title=title,
+        date=dyear,
+        source="gnudb",
+        source_id=discid,
+        tracks=tracks,
+    )
+
+
+def _acoustid_fingerprint(file_path: str) -> list[str]:
+    api_key = os.environ.get("ACOUSTID_API_KEY")
+    if pyacoustid is None or not api_key:
+        return []
+
+    def _do_fingerprint() -> tuple[str, int]:
+        return pyacoustid.fingerprint_file(file_path)
+
+    try:
+        fingerprint, duration = _retry_with_backoff("acoustid")(_do_fingerprint)
+    except Exception:
+        return []
+
+    def _do_lookup() -> list[tuple[str, str]]:
+        return pyacoustid.lookup(api_key, fingerprint, duration)
+
+    try:
+        results = _retry_with_backoff("acoustid")(_do_lookup)
+    except Exception:
+        return []
+
+    mbids: list[str] = []
+    for score, recording_id in results:
+        try:
+            if score and recording_id:
+                mbids.append(str(recording_id))
+        except Exception:
+            continue
+    return mbids
+
+
+def _search_albums_by_recording_mbid(mbid: str) -> list[AlbumInfo]:
+    if musicbrainzngs is None:
+        return []
+    musicbrainzngs.set_useragent("cue-finder", "0.1")
+
+    def _do_lookup() -> dict[str, Any]:
+        return musicbrainzngs.get_recording_by_id(
+            mbid, includes=["releases"]
+        )
+
+    try:
+        result = _retry_with_backoff("musicbrainz")(_do_lookup)
+    except Exception:
+        return []
+
+    recording = result.get("recording", {}) if result else {}
+    albums: list[AlbumInfo] = []
+    for release in recording.get("release-list", [])[:5]:
+        release_id = release.get("id")
+        if not release_id:
+            continue
+        album = _musicbrainz_fetch(release_id)
+        if album and album.tracks and all(t.duration_sec is not None for t in album.tracks):
+            albums.append(album)
+    return albums
+
+
+_SOURCE_SEARCHERS = {
+    "musicbrainz": _musicbrainz_search,
+    "itunes": _itunes_search,
+    "netease": _netease_search,
+    "discogs": _discogs_search,
+    "deezer": _deezer_search,
+    "gnudb": _gnudb_search,
+}
+
+_SOURCE_FETCHERS = {
+    "musicbrainz": _musicbrainz_fetch,
+    "itunes": _itunes_fetch,
+    "netease": _netease_fetch,
+    "discogs": _discogs_fetch,
+    "deezer": _deezer_fetch,
+}
+
+
+def search_album(query: str, sources: list[str] | None = None) -> list[AlbumInfo]:
+    """Search for album metadata across multiple sources with cascading fallback.
+
+    Args:
+        query: Free-text query string (e.g. "Radiohead OK Computer").
+        sources: Ordered list of source names to query. Defaults to the standard
+            cascading priority.
+
+    Returns:
+        A list of normalized album results. If a source returns results, only
+        that source's results are returned; otherwise the next source is tried.
+        Returns an empty list if no source returns results.
+    """
+    if sources is None:
+        sources = list(DEFAULT_SOURCES)
+
+    for source in sources:
+        if not _check_source_available(source):
+            continue
+        searcher = _SOURCE_SEARCHERS.get(source)
+        if searcher is None:
+            continue
+        try:
+            results = searcher(query)
+        except Exception:
+            results = []
+        if results:
+            return results
+    return []
+
+
+def fetch_album(source: str, album_id: str) -> AlbumInfo | None:
+    """Fetch a specific album by source name and source album ID.
+
+    Args:
+        source: Source name (e.g. "musicbrainz", "netease").
+        album_id: Source-specific album identifier.
+
+    Returns:
+        Normalized album metadata, or None if the source is unavailable or
+        the fetch fails.
+    """
+    if not _check_source_available(source):
+        return None
+    fetcher = _SOURCE_FETCHERS.get(source)
+    if fetcher is None:
+        return None
+    try:
+        return fetcher(album_id)
+    except Exception:
+        return None
+
+
+def identify_file(file_path: str) -> list[AlbumInfo]:
+    """Identify a single audio file by AcoustID fingerprint and return albums.
+
+    If fingerprinting yields no matches, falls back to an empty list. This is
+    a supplementary identification method intended for ambiguous text queries.
+
+    Args:
+        file_path: Path to the audio file to fingerprint.
+
+    Returns:
+        A list of normalized album results derived from the fingerprint match.
+    """
+    mbids = _acoustid_fingerprint(file_path)
+    if not mbids:
+        return []
+    for mbid in mbids:
+        albums = _search_albums_by_recording_mbid(mbid)
+        if albums:
+            return albums
+    return []
