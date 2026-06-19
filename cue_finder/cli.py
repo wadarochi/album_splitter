@@ -297,7 +297,7 @@ def split(
                 str(input_path),
                 cue_path_or_timestamps=cue_file if cue_file else ts_list,
                 output_dir=output_dir,
-                output_format=format,
+                format=format,
                 name_template=name_template,
             )
         except Exception as exc:
@@ -472,7 +472,7 @@ def run(
         str(input_path),
         cue_path_or_timestamps=str(cue_path),
         output_dir=str(out_dir),
-        output_format=format,
+        format=format,
     )
     console.print(f"  Split into {len(split_paths)} files")
 

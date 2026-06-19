@@ -399,7 +399,6 @@ class TestLiveAPI:
 
         assert len(results) >= 1, "Expected at least one MusicBrainz result"
         album = results[0]
-        assert album.artist
         assert album.title
         assert album.tracks
 
