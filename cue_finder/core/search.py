@@ -30,13 +30,7 @@ try:
 except Exception:
     pass
 
-pyncm: Any = None
-try:
-    pyncm = importlib.import_module("pyncm")
-    _ = importlib.import_module("pyncm.apis.album")
-    _ = importlib.import_module("pyncm.apis.cloudsearch")
-except Exception:
-    pass
+pyncm: Any = True  # NetEase uses raw requests, always available
 
 pyacoustid: Any = None
 try:
@@ -332,43 +326,54 @@ def _itunes_fetch(album_id: int | str) -> AlbumInfo | None:
 
 
 def _netease_search(query: str) -> list[AlbumInfo]:
-    if pyncm is None:
-        return []
-
-    def _do_search() -> dict[str, Any]:
-        return pyncm.apis.cloudsearch.GetSearchResult(query, type=10, limit=10)
-
+    """Search NetEase Cloud Music using public search API."""
     try:
-        result = _retry_with_backoff("netease")(_do_search)
+        response = requests.get(
+            "https://music.163.com/api/search/get",
+            params={"s": query, "type": 10, "limit": 10, "offset": 0},
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://music.163.com/"},
+            timeout=15,
+        )
+        response.raise_for_status()
+        data = response.json()
     except Exception:
         return []
 
+    if data.get("code") != 200:
+        return []
+
     albums: list[AlbumInfo] = []
-    search_result = result.get("result", {}) if result else {}
-    for album in search_result.get("albums", []):
+    for album in (data.get("result", {}) or {}).get("albums", []):
         album_id = album.get("id")
         if not album_id:
             continue
         fetched = _netease_fetch(album_id)
-        if fetched and fetched.tracks and all(t.duration_sec is not None for t in fetched.tracks):
+        if fetched and fetched.tracks and all(
+            t.duration_sec is not None for t in fetched.tracks
+        ):
             albums.append(fetched)
     return albums
 
 
 def _netease_fetch(album_id: int | str) -> AlbumInfo | None:
-    if pyncm is None:
-        return None
-
-    def _do_fetch() -> dict[str, Any]:
-        return pyncm.apis.album.GetAlbumInfo(album_id)
-
+    """Fetch full album info from NetEase Cloud Music."""
     try:
-        result = _retry_with_backoff("netease")(_do_fetch)
+        response = requests.get(
+            f"https://music.163.com/api/album/{album_id}",
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://music.163.com/"},
+            timeout=15,
+        )
+        response.raise_for_status()
+        data = response.json()
     except Exception:
         return None
 
-    album = result.get("album", {}) if result else {}
-    songs = result.get("songs", []) if result else []
+    if data.get("code") != 200:
+        return None
+
+    album = data.get("album", {}) if data else {}
+    songs = data.get("songs", []) if data else []
+
     artist = _netease_artist_name(album.get("artist", {}))
     title = album.get("name", "")
     publish_time = album.get("publishTime")
