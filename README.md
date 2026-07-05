@@ -5,8 +5,8 @@ End-to-end CLI tool for splitting single-file CD rips (FLAC/WAV/APE) into indivi
 ## Quick start
 
 ```bash
-pip install -e .
-cue-finder run -i album.flac --search "Artist Album" -o ./tracks/
+uv sync
+uv run cue-finder run -i album.flac --search "Artist Album" -o ./tracks/
 ```
 
 This runs the full pipeline: detect silence boundaries, search for album metadata, match tracks, generate a CUE sheet, split the audio, and tag the resulting files.
@@ -21,17 +21,59 @@ This runs the full pipeline: detect silence boundaries, search for album metadat
 
 ### Install from source
 
+This project is managed with [uv](https://docs.astral.sh/uv/). If you don't have uv installed, install it first:
+
+```bash
+# macOS / Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Windows (PowerShell)
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+Then clone and install:
+
 ```bash
 git clone <repository>
 cd cue-finder
-pip install -e .
+uv sync
+```
+
+`uv sync` creates a virtual environment (`.venv`) and installs all dependencies from `pyproject.toml`. Run commands through `uv run` so they use the project environment:
+
+```bash
+uv run cue-finder run -i album.flac --search "Artist Album" -o ./tracks/
 ```
 
 To install development dependencies:
 
 ```bash
+uv sync --extra dev
+```
+
+<details>
+<summary>Using plain pip instead</summary>
+
+If you prefer not to use uv, the project also works with a standard `pip` workflow:
+
+```bash
+git clone <repository>
+cd cue-finder
+python -m venv .venv
+# Windows
+.venv\Scripts\activate
+# macOS / Linux
+source .venv/bin/activate
+pip install -e .
+```
+
+Development dependencies:
+
+```bash
 pip install -e ".[dev]"
 ```
+
+</details>
 
 ### Platform-specific notes
 
@@ -87,7 +129,7 @@ All external binaries are optional. cue-finder auto-detects available tools at r
 
 ```powershell
 # Python package
-pip install -e .
+uv sync
 
 # Optional: add precompiled binaries to PATH
 $env:Path += ";C:\Tools\cue-finder-bin"
@@ -97,14 +139,14 @@ $env:Path += ";C:\Tools\cue-finder-bin"
 
 ```bash
 sudo apt install flac shntool ffmpeg
-pip install -e .
+uv sync
 ```
 
 **macOS**
 
 ```bash
 brew install flac shntool ffmpeg
-pip install -e .
+uv sync
 ```
 
 ## YAML tracklist format
@@ -311,13 +353,13 @@ cue-finder run -i album.flac --tracklist tracklist.yaml -o ./tracks/
 ## Testing
 
 ```bash
-pytest
+uv run pytest
 ```
 
 Integration and slow tests can be skipped with:
 
 ```bash
-pytest -m "not integration and not slow"
+uv run pytest -m "not integration and not slow"
 ```
 
 ## License
