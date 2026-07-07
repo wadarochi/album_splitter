@@ -178,7 +178,10 @@ def _musicbrainz_search(query: str) -> list[AlbumInfo]:
 
     releases = result.get("release-list", []) if result else []
     albums: list[AlbumInfo] = []
-    for release in releases:
+    # Only fetch the top few releases; downstream cross-source ranking will
+    # demote MusicBrainz results when another source has a stronger match,
+    # so fetching all 10 is usually wasted time and API calls.
+    for release in releases[:3]:
         release_id = release.get("id")
         if not release_id:
             continue
@@ -356,10 +359,15 @@ def _netease_search(query: str) -> list[AlbumInfo]:
 
 
 def _netease_fetch(album_id: int | str) -> AlbumInfo | None:
-    """Fetch full album info from NetEase Cloud Music."""
+    """Fetch full album info from NetEase Cloud Music.
+
+    Uses the ``/api/v1/album`` endpoint, which still returns track lists for
+    many region-restricted albums that the older ``/api/album`` endpoint
+    rejects with ``code=-462`` (phone-verification gate).
+    """
     try:
         response = requests.get(
-            f"https://music.163.com/api/album/{album_id}",
+            f"https://music.163.com/api/v1/album/{album_id}",
             headers={"User-Agent": "Mozilla/5.0", "Referer": "https://music.163.com/"},
             timeout=15,
         )
@@ -777,22 +785,106 @@ _SOURCE_FETCHERS = {
 }
 
 
+_CJK_RANGE = r"\u4e00-\u9fff\u3400-\u4dbf\uff00-\uffef"
+_KEEP_CHARS = rf"a-zA-Z0-9{_CJK_RANGE}"
+
+
+def _normalize_query_tokens(text: str | None) -> list[str]:
+    """Tokenize a query for similarity matching.
+
+    Collapse ``S.H.E``-style dotted abbreviations into ``she`` (single token)
+    so that explicit artist names survive source-side token boundary quirks,
+    and strip standalone punctuation noise.
+    """
+    if not text:
+        return []
+    lowered = text.lower()
+    # "S.H.E" → "she"; "U.S.A" → "usa"; "L.L." → "ll"
+    collapsed = re.sub(r"(?<=[a-z])\.(?=[a-z])", "", lowered)
+    # Anything not letter/digit/CJK becomes a separator
+    tokens = re.findall(rf"[{_CJK_RANGE}a-z0-9]+", collapsed, flags=re.UNICODE)
+    return tokens
+
+
+def _match_tier(query_tokens: list[str], album: AlbumInfo) -> int:
+    """Categorize how well ``album`` matches into one of five tiers.
+
+    Lower is better. Tiers preserve source order on ties, so when several
+    albums from the same source fall into the same tier, the source's own
+    relevance ranking wins (e.g. iTunes puts S.H.E's "安可" above the live
+    "2gether 4ever Encore 演唱會" for "S.H.E ENCORE").
+
+    Tier 0: artist tokens ⊆ query AND title tokens ⊆ query.
+            The strongest signal; covers "Pink Floyd Dark Side of the Moon"
+            where the target album's full title is in the query, while
+            "The Wall" only matches the artist.
+    Tier 1: artist tokens ⊆ query but title is NOT a full subset.
+            Covers CJK albums whose Chinese title has no Latin overlap with
+            the English query (e.g. S.H.E "安可" for the query "S.H.E ENCORE").
+    Tier 2: partial artist overlap only.
+    Tier 3: no artist overlap, but title overlaps with the query.
+    Tier 4: nothing matches.
+    """
+    if not query_tokens:
+        return 4
+    query_set = set(query_tokens)
+    artist_tokens = set(_normalize_query_tokens(album.artist))
+    title_tokens = set(_normalize_query_tokens(album.title))
+
+    artist_full_match = bool(artist_tokens and artist_tokens.issubset(query_set))
+    title_full_match = bool(title_tokens and title_tokens.issubset(query_set))
+
+    if artist_full_match and title_full_match:
+        return 0
+    if artist_full_match:
+        return 1
+    if artist_tokens and (artist_tokens & query_set):
+        return 2
+    if title_tokens and (title_tokens & query_set):
+        return 3
+    return 4
+
+
+def _rank_albums_by_similarity(
+    query: str, albums: list[AlbumInfo]
+) -> list[AlbumInfo]:
+    """Stable-sort ``albums`` by match tier (best first), source order within tier.
+
+    The original index encodes ``DEFAULT_SOURCES`` priority plus each
+    source's own relevance ranking, so a tier tie still prefers the source
+    the user configured first and the result that source returned first.
+    """
+    query_tokens = _normalize_query_tokens(query)
+    if not query_tokens:
+        return albums
+    ranked = sorted(
+        enumerate(albums),
+        key=lambda pair: (_match_tier(query_tokens, pair[1]), pair[0]),
+    )
+    return [album for _, album in ranked]
+
+
 def search_album(query: str, sources: list[str] | None = None) -> list[AlbumInfo]:
-    """Search for album metadata across multiple sources with cascading fallback.
+    """Search for album metadata across multiple sources and rank results.
 
     Args:
         query: Free-text query string (e.g. "Radiohead OK Computer").
-        sources: Ordered list of source names to query. Defaults to the standard
-            cascading priority.
+        sources: Optional ordered list of source names. When ``None`` the
+            default cascade is queried. When a single source is provided
+            (e.g. via ``--source itunes``) only that source is queried.
 
     Returns:
-        A list of normalized album results. If a source returns results, only
-        that source's results are returned; otherwise the next source is tried.
-        Returns an empty list if no source returns results.
+        A list of normalized album results ranked by similarity to the
+        query. The best match is ``result[0]`` so the CLI's
+        ``search_album(query)[0]`` heuristic picks the right album even when
+        the first available source returns irrelevant results (e.g.
+        MusicBrainz putting Frank Sinatra first for "S.H.E ENCORE").
     """
     if sources is None:
         sources = list(DEFAULT_SOURCES)
 
+    collected: list[AlbumInfo] = []
+    seen: set[tuple[str, str]] = set()
     for source in sources:
         if not _check_source_available(source):
             continue
@@ -803,9 +895,16 @@ def search_album(query: str, sources: list[str] | None = None) -> list[AlbumInfo
             results = searcher(query)
         except Exception:
             results = []
-        if results:
-            return results
-    return []
+        for album in results:
+            key = (album.source, album.source_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            collected.append(album)
+
+    if not collected:
+        return []
+    return _rank_albums_by_similarity(query, collected)
 
 
 def fetch_album(source: str, album_id: str) -> AlbumInfo | None:

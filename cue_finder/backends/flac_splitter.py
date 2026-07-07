@@ -59,13 +59,22 @@ def _soundfile() -> _SoundFileModule:
 
 
 def _find_backend() -> str | None:
-    """Return the first available FLAC splitting backend name."""
-    if shutil.which("flac-tracksplit"):
-        return "flac-tracksplit"
+    """Return the first available FLAC splitting backend name.
+
+    Note: ``flac-tracksplit`` is intentionally deprioritized below
+    ``shnsplit``. The upstream ``flac-tracksplit`` CLI (v0.1.0) expects FLAC
+    files with an embedded CUE sheet and does not accept an external
+    ``-c`` cue path, so it is not directly usable by cue-finder's
+    generate-CUE-then-split workflow. Until the backend is updated to embed
+    the CUE sheet into a temporary FLAC copy, prefer ``shnsplit`` (or
+    ``flacsplt``) which handle external CUE files correctly.
+    """
     if shutil.which("flacsplt"):
         return "flacsplt"
     if shutil.which("shnsplit") and (shutil.which("flac") or shutil.which("flac.exe")):
         return "shnsplit"
+    if shutil.which("flac-tracksplit"):
+        return "flac-tracksplit"
     return None
 
 

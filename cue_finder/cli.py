@@ -175,6 +175,7 @@ def generate(
     tracklist_file: Optional[str] = typer.Option(None, "--tracklist", help="YAML or plain text tracklist file."),
     search_query: Optional[str] = typer.Option(None, "--search", help="Search query for metadata lookup."),
     output: str = typer.Option(..., "-o", "--output", help="Output CUE file path."),
+    source: Optional[str] = typer.Option(None, "--source", "-s", help="Metadata source(s), comma-separated (musicbrainz,itunes,netease,discogs,deezer,gnudb)."),
 ) -> None:
     """Generate a CUE sheet from detected boundaries and metadata."""
     from cue_finder.core.cue import CueTrack, generate_cue, seconds_to_msf, write_cue
@@ -220,7 +221,8 @@ def generate(
             album_artist = ""
             album_title = ""
     elif search_query:
-        results = search_album(search_query)
+        sources = [s.strip() for s in source.split(",") if s.strip()] if source else None
+        results = search_album(search_query, sources=sources)
         if not results:
             console.print("[yellow]No metadata found for query.[/yellow]")
             raise typer.Exit(EXIT_PARTIAL)
@@ -343,12 +345,44 @@ def tag(
 
 
 @app.command()
+def cleanup_pregap(
+    track_dir: str = typer.Option(..., "-d", "--track-dir", help="Directory containing split track files."),
+    min_duration: float = typer.Option(0.0, "--min-duration", help="Also drop tracks shorter than this many seconds (0 = disabled)."),
+    keep_pregap: bool = typer.Option(False, "--keep-pregap", help="Keep track-0 files named pregap/silence."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be done without changing files."),
+) -> None:
+    """Remove pregap/short tracks and renumber remaining files."""
+    from cue_finder.core.cleanup import cleanup_tracks
+
+    try:
+        actions = cleanup_tracks(
+            track_dir=track_dir,
+            min_duration=min_duration,
+            remove_pregap=not keep_pregap,
+            dry_run=dry_run,
+            progress_callback=lambda msg: console.print(f"  {msg}"),
+        )
+    except Exception as exc:
+        logger.error("Cleanup failed: %s", exc)
+        console.print(Panel(f"Cleanup failed: {exc}", title="Error", border_style="red"))
+        raise typer.Exit(EXIT_FAILURE)
+
+    if dry_run:
+        console.print(f"[yellow]Dry run: {len(actions)} actions planned.[/yellow]")
+    elif actions:
+        console.print(f"[green]Cleaned up {len(actions)} files.[/green]")
+    else:
+        console.print("[dim]No cleanup actions needed.[/dim]")
+
+
+@app.command()
 def run(
     input_file: str = typer.Option(..., "-i", "--input", help="Input audio file path."),
     search_query: Optional[str] = typer.Option(None, "--search", help="Search query for metadata."),
     tracklist: Optional[str] = typer.Option(None, "--tracklist", help="YAML or plain text tracklist file."),
     output_dir: str = typer.Option(..., "-o", "--output", help="Output directory."),
     format: Optional[str] = typer.Option(None, "--format", help="Output audio format."),
+    source: Optional[str] = typer.Option(None, "--source", "-s", help="Metadata source(s), comma-separated (musicbrainz,itunes,netease,discogs,deezer,gnudb)."),
     threshold: float = typer.Option(-40.0, "--threshold", help="Silence threshold in dB."),
     min_length: int = typer.Option(5000, "--min-length", help="Minimum track length in ms."),
     min_interval: int = typer.Option(300, "--min-interval", help="Minimum silence interval in ms."),
@@ -357,9 +391,12 @@ def run(
     use_beets: bool = typer.Option(True, "--beets/--no-beets", help="Use beets for tagging."),
     beets_config: Optional[str] = typer.Option(None, "--beets-config", help="Custom beets config file path."),
     beets_mode: str = typer.Option("album", "--beets-mode", help="beets import mode."),
+    cleanup_pregap_flag: bool = typer.Option(False, "--cleanup-pregap", help="Remove pregap/short tracks after splitting."),
+    min_track_duration: float = typer.Option(0.0, "--min-track-duration", help="Also drop tracks shorter than this many seconds when --cleanup-pregap is used (0 = disabled)."),
 ) -> None:
-    """Run the full pipeline: detect -> search -> match -> generate CUE -> split -> tag."""
+    """Run the full pipeline: detect -> search -> match -> generate CUE -> split -> tag -> optional cleanup."""
     import soundfile
+    from cue_finder.core.cleanup import cleanup_tracks
     from cue_finder.core.cue import CueTrack, generate_cue, seconds_to_msf, write_cue
     from cue_finder.core.match import TrackMatcher
     from cue_finder.core.silence import SilenceDetector
@@ -410,7 +447,8 @@ def run(
             album_artist = ""
             album_title = ""
     elif search_query:
-        results = search_album(search_query)
+        sources = [s.strip() for s in source.split(",") if s.strip()] if source else None
+        results = search_album(search_query, sources=sources)
         if not results:
             console.print("[yellow]No metadata found. Using numbered tracks.[/yellow]")
             n = len(boundaries) + 1
@@ -487,6 +525,20 @@ def run(
         console.print(f"  [green]Tagged {len(tag_result.tagged_files)} files.[/green]")
     else:
         console.print(f"  [yellow]Tagging: {len(tag_result.warnings)} warnings[/yellow]")
+
+    if cleanup_pregap_flag:
+        console.print("[bold]Post-split cleanup...[/bold]")
+        try:
+            cleanup_actions = cleanup_tracks(
+                track_dir=str(out_dir),
+                min_duration=min_track_duration,
+                remove_pregap=True,
+                dry_run=False,
+            )
+            console.print(f"  Removed/renamed {len(cleanup_actions)} files")
+        except Exception as exc:
+            logger.error("Post-split cleanup failed: %s", exc)
+            console.print(f"[yellow]Cleanup failed: {exc}[/yellow]")
 
     console.print(f"\n[bold green]✓ Pipeline complete. Output in {out_dir}[/bold green]")
 

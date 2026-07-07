@@ -127,6 +127,19 @@ class CueSheet:
         )
 
 
+def _audio_basename(audio_filename: str) -> str:
+    """Return the basename of an audio filename path.
+
+    Splits on both POSIX (``/``) and Windows (``\\``) separators so that a
+    caller may pass a full OS path on either platform without leaking a
+    directory prefix into the CUE ``FILE`` reference (which is resolved
+    relative to the CUE sheet itself).
+    """
+    if not audio_filename:
+        return audio_filename
+    return re.split(r"[\\/]", audio_filename)[-1]
+
+
 def _quote_cue(value: str) -> str:
     """Return a string safe to embed inside CUE double quotes."""
     return value.replace('"', "'")
@@ -179,7 +192,7 @@ def generate_cue(
     if rem_fields is None:
         rem_fields = {}
     tracks = [_track_from_item(item, i + 1) for i, item in enumerate(matched_tracks)]
-    audio_basename = Path(audio_filename).name
+    audio_basename = _audio_basename(audio_filename)
 
     lines: list[str] = []
     if album_artist:
@@ -400,7 +413,7 @@ def generate_cue_multidisc(discs: Iterable[CueSheet | _DiscDict]) -> str:
             disc_title = disc.get("album_title", "")
             rem_fields = disc.get("rem_fields", {})
 
-        audio_basename = Path(audio_filename).name
+        audio_basename = _audio_basename(audio_filename)
 
         if first_disc:
             album_artist = disc_artist

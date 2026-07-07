@@ -109,12 +109,16 @@ class Splitter:
             "wav": "wave",
             "ape": None,
         }
-        if self.backends.get("flac-tracksplit"):
-            selected["flac"] = "flac-tracksplit"
-        elif self.backends.get("flacsplt"):
+        # Order matches flac_splitter._find_backend: flacsplt, then shnsplit,
+        # then flac-tracksplit. flac-tracksplit is deprioritized because the
+        # upstream v0.1.0 CLI requires an embedded CUE sheet, which cue-finder
+        # does not yet prepare for it.
+        if self.backends.get("flacsplt"):
             selected["flac"] = "flacsplt"
         elif self.backends.get("shnsplit"):
             selected["flac"] = "shnsplit"
+        elif self.backends.get("flac-tracksplit"):
+            selected["flac"] = "flac-tracksplit"
 
         if self.backends.get("mac.exe") or self.backends.get("mac"):
             selected["ape"] = "mac.exe"
@@ -178,6 +182,11 @@ class Splitter:
 
         if input_format == "flac":
             cue_path = cue_path_or_timestamps if isinstance(cue_path_or_timestamps, str) else ""
+            # shnsplit backend runs subprocess with cwd=output_dir, so a
+            # relative cue_path must be resolved here or shnsplit fails to
+            # open "<output_dir>/<relative_cue_path>".
+            if cue_path:
+                cue_path = os.path.abspath(cue_path)
             return flac_splitter.split(
                 flac_path=audio_path,
                 cue_path=cue_path,

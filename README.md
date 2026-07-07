@@ -85,8 +85,11 @@ pip install -e ".[dev]"
 
 **Linux**
 - Most external tools are available through your distribution's package manager.
-- `shntool` + `flac` provide a reliable FLAC splitting fallback.
-- `mac` (Monkey's Audio) may need to be compiled from source or installed from a third-party repository.
+- Minimum: `sudo apt install flac shntool ffmpeg` gives FLAC/WAV splitting (`shnsplit`) and CUE-based tagging (`cuetag`).
+- Recommended: also `sudo apt install mp3splt` (frame-level splitter, no re-encode) and `uv pip install beets` (advanced tagger).
+- `mac` (Monkey's Audio) is not in Debian/Ubuntu main repos — APE inputs require building it from source or using a third-party package.
+- `flac-tracksplit` (frame-level lossless FLAC splitter) is also missing from apt; install via `cargo install flac-tracksplit` if you want it.
+- See the "Installation examples → Linux (Debian/Ubuntu)" section below for the full apt commands.
 
 **macOS**
 - Homebrew is the easiest way to get `flac`, `shntool`, `ffmpeg`, and `beets`.
@@ -137,16 +140,58 @@ $env:Path += ";C:\Tools\cue-finder-bin"
 
 **Linux (Debian/Ubuntu)**
 
+Minimum: split FLAC/WAV and tag with the internal mutagen fallback.
+
 ```bash
 sudo apt install flac shntool ffmpeg
 uv sync
 ```
 
+What each apt package provides:
+
+| apt package     | Binary provided                       | Used by cue-finder for                                           |
+|-----------------|---------------------------------------|------------------------------------------------------------------|
+| `flac`          | `flac`                                | Encode/decode FLAC; encoder for `shnsplit`.                       |
+| `shntool`       | `shnsplit`, `cuetag`                  | Sample-accurate FLAC splitting (`run`/`split`); CUE-based tagging (`tag`). |
+| `ffmpeg`        | `ffmpeg`                              | WAV/APE transcoding, general decode/encode fallback.             |
+
+Recommended additions (frame-level splitting with no re-encoding, plus beets tagging):
+
+```bash
+# flacsplt — frame-level CUE-based FLAC splitter (preferred over shnsplit)
+sudo apt install mp3splt
+
+# beets — advanced tagger used by `run --beets` (default enabled)
+# Install it inside the project's venv so it sees the same Python:
+uv pip install beets
+# Or use the older system beets (may be missing features):
+# sudo apt install beets
+```
+
+Optional extras:
+
+```bash
+# flac-tracksplit — frame-level lossless FLAC splitter (best quality, no re-encode).
+# Not packaged by apt; install via cargo or download a prebuilt binary.
+cargo install flac-tracksplit
+
+# APE source files (`.ape`) require the `mac` (Monkey's Audio) decoder.
+# Not in Debian/Ubuntu main repos — build from source or use a third-party package.
+# Without `mac`, APE inputs cannot be decoded; convert to FLAC/WAV first.
+```
+
+After installing, verify which backends the tool detects:
+
+```bash
+uv run python -c "from cue_finder.core.split import Splitter; print(Splitter().report_backends())"
+```
+
 **macOS**
 
 ```bash
-brew install flac shntool ffmpeg
+brew install flac shntool ffmpeg mp3splt
 uv sync
+uv pip install beets
 ```
 
 ## YAML tracklist format
