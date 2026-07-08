@@ -7,6 +7,7 @@ import pytest
 from cue_finder.core.cue import (
     CueSheet,
     CueTrack,
+    find_local_cue,
     generate_cue,
     msf_to_seconds,
     parse_cue,
@@ -257,3 +258,31 @@ class TestMultiDisc:
         assert 'TRACK 02 AUDIO' in cue_text
         assert 'TRACK 03 AUDIO' in cue_text
         assert 'TRACK 04 AUDIO' in cue_text
+
+
+class TestFindLocalCue:
+    def test_finds_same_stem_cue(self, tmp_path):
+        audio = tmp_path / "album.flac"
+        cue = tmp_path / "album.cue"
+        audio.write_text("audio")
+        cue.write_text("CUE")
+
+        found = find_local_cue(audio)
+        assert found == cue
+
+    def test_prefers_exact_stem_over_partial_match(self, tmp_path):
+        audio = tmp_path / "album.flac"
+        exact = tmp_path / "album.cue"
+        partial = tmp_path / "album_backup.cue"
+        audio.write_text("audio")
+        exact.write_text("CUE")
+        partial.write_text("CUE")
+
+        found = find_local_cue(audio)
+        assert found == exact
+
+    def test_returns_none_when_no_cue(self, tmp_path):
+        audio = tmp_path / "album.flac"
+        audio.write_text("audio")
+
+        assert find_local_cue(audio) is None

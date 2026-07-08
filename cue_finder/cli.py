@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -40,6 +41,7 @@ def _setup_logging(verbose: bool, quiet: bool) -> None:
         format="%(levelname)s: %(message)s",
         stream=sys.stderr,
     )
+    logging.getLogger("musicbrainzngs").setLevel(logging.WARNING)
 
 
 @app.callback()
@@ -176,12 +178,15 @@ def generate(
     search_query: Optional[str] = typer.Option(None, "--search", help="Search query for metadata lookup."),
     output: str = typer.Option(..., "-o", "--output", help="Output CUE file path."),
     source: Optional[str] = typer.Option(None, "--source", "-s", help="Metadata source(s), comma-separated (musicbrainz,itunes,netease,discogs,deezer,gnudb)."),
+    no_local_cue: bool = typer.Option(False, "--no-local-cue", help="Ignore local CUE sheets and force search."),
+    acoustid: bool = typer.Option(True, "--acoustid/--no-acoustid", help="Use AcoustID fingerprinting when ACOUSTID_API_KEY is set."),
 ) -> None:
     """Generate a CUE sheet from detected boundaries and metadata."""
-    from cue_finder.core.cue import CueTrack, generate_cue, seconds_to_msf, write_cue
+    from cue_finder.core.cue import CueTrack, find_local_cue, generate_cue, parse_cue, seconds_to_msf, write_cue
     from cue_finder.core.match import TrackMatcher
+    from cue_finder.core.rank import score_candidates
     from cue_finder.core.silence import SilenceDetector
-    from cue_finder.core.search import search_album
+    from cue_finder.core.search import fingerprint_file_with_ids, search_album
     from cue_finder.core.tracklist import detect_format, load_tracklist, parse_plain_text
     import soundfile
 
@@ -202,8 +207,20 @@ def generate(
         sample_rate = sf.samplerate
         total_duration = sf.frames / sample_rate
 
-    # Get track info from tracklist or search
-    if tracklist_file:
+    local_cue_path = None if no_local_cue else find_local_cue(input_path)
+    if local_cue_path:
+        console.print(f"  Using local CUE: {local_cue_path}")
+        cue_sheet = parse_cue(local_cue_path)
+        track_titles = [t.title for t in cue_sheet.tracks]
+        track_artists = [t.performer for t in cue_sheet.tracks]
+        starts = [t.start_seconds for t in cue_sheet.tracks]
+        track_durations = [
+            (starts[i + 1] if i + 1 < len(starts) else total_duration) - starts[i]
+            for i in range(len(starts))
+        ]
+        album_artist = cue_sheet.performer
+        album_title = cue_sheet.title
+    elif tracklist_file:
         fmt = detect_format(Path(tracklist_file))
         if fmt == "yaml":
             tl = load_tracklist(Path(tracklist_file))
@@ -223,10 +240,31 @@ def generate(
     elif search_query:
         sources = [s.strip() for s in source.split(",") if s.strip()] if source else None
         results = search_album(search_query, sources=sources)
+
+        fingerprint_release_ids: set[str] = set()
+        if acoustid and os.environ.get("ACOUSTID_API_KEY"):
+            console.print("  Fingerprinting with AcoustID...")
+            try:
+                ac_albums, ac_ids = fingerprint_file_with_ids(str(input_path))
+                fingerprint_release_ids.update(ac_ids)
+                seen_keys = {(a.source, a.source_id) for a in results}
+                for album in ac_albums:
+                    if (album.source, album.source_id) not in seen_keys:
+                        results.append(album)
+                        seen_keys.add((album.source, album.source_id))
+            except Exception as exc:
+                console.print(f"  [yellow]AcoustID fingerprinting failed: {exc}[/yellow]")
+
         if not results:
             console.print("[yellow]No metadata found for query.[/yellow]")
             raise typer.Exit(EXIT_PARTIAL)
-        album = results[0]
+        scored = score_candidates(results, boundaries, total_duration, search_query, fingerprint_release_ids=fingerprint_release_ids)
+        album = scored[0].album
+        console.print(f"  Matched: {album.artist} — {album.title} ({album.source}, score={scored[0].total_score:.2f})")
+        if len(scored) > 1:
+            console.print("  Alternatives:")
+            for alt in scored[1:4]:
+                console.print(f"    - {alt.album.artist} — {alt.album.title} ({alt.album.source}, score={alt.total_score:.2f})")
         track_titles = [t.title for t in album.tracks]
         track_durations = [t.duration_sec for t in album.tracks]
         track_artists = [t.artist or album.artist for t in album.tracks]
@@ -393,14 +431,17 @@ def run(
     beets_mode: str = typer.Option("album", "--beets-mode", help="beets import mode."),
     cleanup_pregap_flag: bool = typer.Option(False, "--cleanup-pregap", help="Remove pregap/short tracks after splitting."),
     min_track_duration: float = typer.Option(0.0, "--min-track-duration", help="Also drop tracks shorter than this many seconds when --cleanup-pregap is used (0 = disabled)."),
+    no_local_cue: bool = typer.Option(False, "--no-local-cue", help="Ignore local CUE sheets and force search."),
+    acoustid: bool = typer.Option(True, "--acoustid/--no-acoustid", help="Use AcoustID fingerprinting when ACOUSTID_API_KEY is set."),
 ) -> None:
     """Run the full pipeline: detect -> search -> match -> generate CUE -> split -> tag -> optional cleanup."""
     import soundfile
     from cue_finder.core.cleanup import cleanup_tracks
-    from cue_finder.core.cue import CueTrack, generate_cue, seconds_to_msf, write_cue
+    from cue_finder.core.cue import CueTrack, find_local_cue, generate_cue, parse_cue, seconds_to_msf, write_cue
     from cue_finder.core.match import TrackMatcher
+    from cue_finder.core.rank import score_candidates
     from cue_finder.core.silence import SilenceDetector
-    from cue_finder.core.search import search_album
+    from cue_finder.core.search import fingerprint_file_with_ids, search_album
     from cue_finder.core.split import Splitter
     from cue_finder.core.tag import tag_tracks
     from cue_finder.core.tracklist import detect_format, load_tracklist, parse_plain_text
@@ -428,8 +469,21 @@ def run(
         total_duration = sf.frames / sample_rate
 
     # Step 2: Metadata
-    console.print("[bold]Step 2/5: Searching metadata...[/bold]")
-    if tracklist:
+    console.print("[bold]Step 2/5: Loading metadata...[/bold]")
+    local_cue_path = None if no_local_cue else find_local_cue(input_path)
+    if local_cue_path:
+        console.print(f"  Using local CUE: {local_cue_path}")
+        cue_sheet = parse_cue(local_cue_path)
+        track_titles = [t.title for t in cue_sheet.tracks]
+        track_artists = [t.performer for t in cue_sheet.tracks]
+        starts = [t.start_seconds for t in cue_sheet.tracks]
+        track_durations = [
+            (starts[i + 1] if i + 1 < len(starts) else total_duration) - starts[i]
+            for i in range(len(starts))
+        ]
+        album_artist = cue_sheet.performer
+        album_title = cue_sheet.title
+    elif tracklist:
         fmt = detect_format(Path(tracklist))
         if fmt == "yaml":
             tl = load_tracklist(Path(tracklist))
@@ -449,6 +503,21 @@ def run(
     elif search_query:
         sources = [s.strip() for s in source.split(",") if s.strip()] if source else None
         results = search_album(search_query, sources=sources)
+
+        fingerprint_release_ids: set[str] = set()
+        if acoustid and os.environ.get("ACOUSTID_API_KEY"):
+            console.print("  Fingerprinting with AcoustID...")
+            try:
+                ac_albums, ac_ids = fingerprint_file_with_ids(str(input_path))
+                fingerprint_release_ids.update(ac_ids)
+                seen_keys = {(a.source, a.source_id) for a in results}
+                for album in ac_albums:
+                    if (album.source, album.source_id) not in seen_keys:
+                        results.append(album)
+                        seen_keys.add((album.source, album.source_id))
+            except Exception as exc:
+                console.print(f"  [yellow]AcoustID fingerprinting failed: {exc}[/yellow]")
+
         if not results:
             console.print("[yellow]No metadata found. Using numbered tracks.[/yellow]")
             n = len(boundaries) + 1
@@ -458,8 +527,14 @@ def run(
             album_artist = ""
             album_title = input_path.stem
         else:
-            album = results[0]
-            console.print(f"  Matched: {album.artist} — {album.title} ({album.source})")
+            scored = score_candidates(results, boundaries, total_duration, search_query, fingerprint_release_ids=fingerprint_release_ids)
+            album = scored[0].album
+            console.print(f"  Matched: {album.artist} — {album.title} ({album.source}, score={scored[0].total_score:.2f})")
+            if len(scored) > 1:
+                console.print("  Alternatives:")
+                for alt in scored[1:4]:
+                    flag_str = f", flags={alt.flags}" if alt.flags else ""
+                    console.print(f"    - {alt.album.artist} — {alt.album.title} ({alt.album.source}, score={alt.total_score:.2f}{flag_str})")
             track_titles = [t.title for t in album.tracks]
             track_durations = [t.duration_sec for t in album.tracks]
             track_artists = [t.artist or album.artist for t in album.tracks]

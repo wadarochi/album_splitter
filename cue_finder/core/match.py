@@ -24,9 +24,40 @@ class TrackMatcher:
     Fallback: greedy nearest-neighbor matching.
     """
 
-    def __init__(self, tolerance: float = 3.0, gap_seconds: float = 30.0):
+    def __init__(
+        self,
+        tolerance: float = 3.0,
+        gap_seconds: float = 30.0,
+        min_segment_duration: float = 15.0,
+    ):
         self.tolerance = tolerance
         self.gap_seconds = gap_seconds
+        self.min_segment_duration = min_segment_duration
+
+    def _merge_short_segments(
+        self, boundaries: list[float], total_duration: float
+    ) -> list[float]:
+        """Remove spurious boundaries that create segments shorter than the threshold.
+
+        Very short detected segments are usually quiet passages inside a real
+        track rather than separate tracks. Merging them before DTW prevents the
+        aligner from getting derailed by false-positive silence detections.
+        """
+        boundaries = list(boundaries)
+        changed = True
+        while changed and boundaries:
+            changed = False
+            starts = [0.0] + boundaries + [total_duration]
+            durations = [starts[i + 1] - starts[i] for i in range(len(starts) - 1)]
+            for i, duration in enumerate(durations):
+                if duration < self.min_segment_duration:
+                    if i + 1 < len(durations):
+                        boundaries = boundaries[:i] + boundaries[i + 1 :]
+                    elif i > 0:
+                        boundaries = boundaries[: i - 1] + boundaries[i:]
+                    changed = True
+                    break
+        return boundaries
 
     def match(
         self,
@@ -45,34 +76,22 @@ class TrackMatcher:
             track_artists: Track artists from metadata.
             total_duration: Total duration of the audio file.
         """
+        boundaries = self._merge_short_segments(boundaries, total_duration)
+
         # Build expected boundaries by accumulating track durations
         expected_starts = self._durations_to_boundaries(track_durations)
 
-        # Try DTW first
-        dtw_matches = self._dtw_match(boundaries, expected_starts, total_duration)
-        avg_conf = np.mean([m.confidence for m in dtw_matches]) if dtw_matches else 0.0
-
-        if avg_conf < 0.5 and len(boundaries) > 0:
-            greedy_matches = self._greedy_match(
-                boundaries, expected_starts, total_duration
-            )
-            greedy_avg = (
-                np.mean([m.confidence for m in greedy_matches])
-                if greedy_matches
-                else 0.0
-            )
-            if greedy_avg > avg_conf:
-                dtw_matches = greedy_matches
+        matches = self._dtw_match(boundaries, expected_starts, total_duration)
 
         # Fill in titles and artists
-        for match in dtw_matches:
+        for match in matches:
             idx = match.number - 1
             if 0 <= idx < len(track_titles):
                 match.title = track_titles[idx]
             if 0 <= idx < len(track_artists):
                 match.artist = track_artists[idx]
 
-        return dtw_matches
+        return matches
 
     def _durations_to_boundaries(self, durations: list[float]) -> list[float]:
         """Convert track durations to expected boundary timestamps."""
@@ -109,58 +128,86 @@ class TrackMatcher:
             end = expected_starts[i + 1] if i + 1 < len(expected_starts) else total_duration
             expected_durations.append(end - expected_starts[i])
 
-        # Build cost matrix
         cost = np.zeros((n, m))
         for i in range(n):
             for j in range(m):
-                diff = abs(actual_durations[i] - expected_durations[j])
-                if diff <= self.tolerance:
-                    cost[i, j] = diff
-                else:
-                    cost[i, j] = diff * 2  # penalty for out-of-tolerance
+                expected = expected_durations[j]
+                relative_diff = abs(actual_durations[i] - expected) / max(expected, 1.0)
+                cost[i, j] = relative_diff
 
-        # DTW with Sakoe-Chiba band
         dtw_matrix = np.full((n + 1, m + 1), np.inf)
         dtw_matrix[0, 0] = 0
 
+        skip_segment_cost = 0.5
+        share_segment_cost = 0.05
+
         for i in range(1, n + 1):
             for j in range(1, m + 1):
-                if abs(i - j) > self.tolerance:
-                    continue  # Sakoe-Chiba band constraint
-                dtw_matrix[i, j] = cost[i - 1, j - 1] + min(
-                    dtw_matrix[i - 1, j],
-                    dtw_matrix[i, j - 1],
-                    dtw_matrix[i - 1, j - 1],
-                )
+                match_cost = dtw_matrix[i - 1, j - 1] + cost[i - 1, j - 1]
+                skip_actual = dtw_matrix[i - 1, j] + skip_segment_cost
+                share_actual = dtw_matrix[i, j - 1] + share_segment_cost
+                dtw_matrix[i, j] = min(match_cost, skip_actual, share_actual)
 
-        # Backtrack to find alignment
-        matches: list[TrackMatch] = []
+        alignment: list[int] = [-1] * m
         i, j = n, m
         while i > 0 and j > 0:
-            dur_diff = abs(actual_durations[i - 1] - expected_durations[j - 1])
-            confidence = max(0.0, 1.0 - dur_diff / max(self.tolerance, expected_durations[j - 1]))
-            flags: list[str] = []
+            current = dtw_matrix[i, j]
+            match_prev = dtw_matrix[i - 1, j - 1] + cost[i - 1, j - 1]
+            skip_prev = dtw_matrix[i - 1, j] + skip_segment_cost
+            share_prev = dtw_matrix[i, j - 1] + share_segment_cost
+            best = min(match_prev, skip_prev, share_prev)
+            if best == match_prev:
+                alignment[j - 1] = i - 1
+                i -= 1
+                j -= 1
+            elif best == skip_prev:
+                i -= 1
+            else:
+                alignment[j - 1] = i - 1
+                j -= 1
 
-            if dur_diff > self.tolerance:
-                flags.append("duration_mismatch")
+        matches: list[TrackMatch] = []
+        run_start = 0
+        while run_start < m:
+            seg_idx = alignment[run_start]
+            run_end = run_start + 1
+            while run_end < m and alignment[run_end] == seg_idx:
+                run_end += 1
 
-            matches.append(
-                TrackMatch(
-                    number=j,
-                    title="",
-                    artist="",
-                    start=actual_starts[i - 1],
-                    end=actual_ends[i - 1],
-                    expected_duration=expected_durations[j - 1],
-                    actual_duration=actual_durations[i - 1],
-                    confidence=confidence,
-                    flags=flags,
+            seg_start = actual_starts[seg_idx]
+            seg_end = actual_ends[seg_idx]
+            seg_duration = seg_end - seg_start
+
+            expected_sum = sum(expected_durations[k] for k in range(run_start, run_end))
+            offset = 0.0
+            for k in range(run_start, run_end):
+                ratio = expected_durations[k] / max(expected_sum, 1.0)
+                track_start = seg_start + offset
+                track_end = seg_start + offset + ratio * seg_duration
+                actual_dur = track_end - track_start
+                dur_diff = abs(actual_dur - expected_durations[k])
+                confidence = max(0.0, 1.0 - (dur_diff / self.tolerance) ** 2)
+                flags: list[str] = []
+                if dur_diff > self.tolerance:
+                    flags.append("duration_mismatch")
+                if run_end - run_start > 1:
+                    flags.append("shared_segment")
+                matches.append(
+                    TrackMatch(
+                        number=k + 1,
+                        title="",
+                        artist="",
+                        start=track_start,
+                        end=track_end,
+                        expected_duration=expected_durations[k],
+                        actual_duration=actual_dur,
+                        confidence=confidence,
+                        flags=flags,
+                    )
                 )
-            )
-            i -= 1
-            j -= 1
+                offset += ratio * seg_duration
 
-        matches.reverse()
+            run_start = run_end
 
         # Handle extra segments (N > M) or missing tracks (N < M)
         if n > m:
@@ -201,9 +248,9 @@ class TrackMatcher:
                     best_i = i
 
             if best_dist <= self.tolerance:
-                confidence = max(0.0, 1.0 - best_dist / self.tolerance)
+                confidence = max(0.0, 1.0 - (best_dist / self.tolerance) ** 2)
             else:
-                confidence = max(0.0, 1.0 - best_dist / (self.tolerance * 3))
+                confidence = max(0.0, 1.0 - (best_dist / (self.tolerance * 3)) ** 2)
 
             matches.append(
                 TrackMatch(

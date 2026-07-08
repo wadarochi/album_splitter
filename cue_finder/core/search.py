@@ -34,7 +34,7 @@ pyncm: Any = True  # NetEase uses raw requests, always available
 
 pyacoustid: Any = None
 try:
-    pyacoustid = importlib.import_module("pyacoustid")
+    pyacoustid = importlib.import_module("acoustid")
 except Exception:
     pass
 
@@ -709,35 +709,47 @@ def _gnudb_fetch(discid: str) -> AlbumInfo | None:
     )
 
 
-def _acoustid_fingerprint(file_path: str) -> list[str]:
+def _acoustid_fingerprint_releases(file_path: str) -> list[tuple[float, str]]:
+    """Fingerprint ``file_path`` and return AcoustID-matched release MBIDs.
+
+    Each returned tuple is ``(score, release_mbid)`` sorted by descending
+    score. An empty list means fingerprinting failed, no API key is
+    configured, or the backend is unavailable.
+    """
     api_key = os.environ.get("ACOUSTID_API_KEY")
     if pyacoustid is None or not api_key:
         return []
 
-    def _do_fingerprint() -> tuple[str, int]:
-        return pyacoustid.fingerprint_file(file_path)
-
     try:
-        fingerprint, duration = _retry_with_backoff("acoustid")(_do_fingerprint)
+        duration, fingerprint = _retry_with_backoff("acoustid")(
+            lambda: pyacoustid.fingerprint_file(file_path)
+        )
     except Exception:
         return []
 
-    def _do_lookup() -> list[tuple[str, str]]:
-        return pyacoustid.lookup(api_key, fingerprint, duration)
-
     try:
-        results = _retry_with_backoff("acoustid")(_do_lookup)
+        response = _retry_with_backoff("acoustid")(
+            lambda: pyacoustid.lookup(
+                api_key, fingerprint, duration, meta=["recordings", "releaseids"]
+            )
+        )
     except Exception:
         return []
 
-    mbids: list[str] = []
-    for score, recording_id in results:
-        try:
-            if score and recording_id:
-                mbids.append(str(recording_id))
-        except Exception:
-            continue
-    return mbids
+    if not isinstance(response, dict) or response.get("status") != "ok":
+        return []
+
+    releases: list[tuple[float, str]] = []
+    for result in response.get("results", []):
+        score = result.get("score") or 0.0
+        for recording in result.get("recordings", []):
+            for release in recording.get("releases", []):
+                mbid = release.get("id")
+                if mbid:
+                    releases.append((float(score), str(mbid)))
+
+    releases.sort(key=lambda pair: pair[0], reverse=True)
+    return releases
 
 
 def _search_albums_by_recording_mbid(mbid: str) -> list[AlbumInfo]:
@@ -941,11 +953,30 @@ def identify_file(file_path: str) -> list[AlbumInfo]:
     Returns:
         A list of normalized album results derived from the fingerprint match.
     """
-    mbids = _acoustid_fingerprint(file_path)
-    if not mbids:
-        return []
-    for mbid in mbids:
-        albums = _search_albums_by_recording_mbid(mbid)
-        if albums:
-            return albums
-    return []
+    albums, _release_ids = fingerprint_file_with_ids(file_path)
+    return albums
+
+
+def fingerprint_file_with_ids(file_path: str) -> tuple[list[AlbumInfo], set[str]]:
+    """Fingerprint a file once and return both matched albums and release IDs.
+
+    Returns a tuple of (albums, release_mbid_set). The set can be passed to
+    ``score_candidates`` as ``fingerprint_release_ids`` to boost candidates
+    that AcoustID identified.
+    """
+    releases = _acoustid_fingerprint_releases(file_path)
+    if not releases:
+        return [], set()
+
+    albums: list[AlbumInfo] = []
+    release_ids: set[str] = set()
+    seen: set[str] = set()
+    for _score, mbid in releases:
+        if mbid in seen:
+            continue
+        seen.add(mbid)
+        release_ids.add(mbid)
+        album = _musicbrainz_fetch(mbid)
+        if album and album.tracks and all(t.duration_sec is not None for t in album.tracks):
+            albums.append(album)
+    return albums, release_ids

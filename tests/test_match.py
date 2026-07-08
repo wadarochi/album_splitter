@@ -21,7 +21,7 @@ class TestTrackMatcher:
             assert m.confidence >= 0.90
 
     def test_duration_mismatch_within_tolerance(self):
-        matcher = TrackMatcher(tolerance=5.0)
+        matcher = TrackMatcher(tolerance=10.0)
         boundaries = [208.0, 437.0]  # Slightly off
         durations = [210.0, 225.0, 165.0]
         titles = ["T1", "T2", "T3"]

@@ -13,6 +13,7 @@ FRAMES_PER_SECOND = 75
 __all__ = [
     "CueSheet",
     "CueTrack",
+    "find_local_cue",
     "generate_cue",
     "generate_cue_multidisc",
     "msf_to_seconds",
@@ -223,10 +224,21 @@ def write_cue(cue_text: str, output_path: str | Path) -> None:
     _ = output_path.write_text(cue_text, encoding="utf-8-sig")
 
 
+def _decode_cue_text(raw: bytes) -> str:
+    """Decode CUE text, tolerating legacy Chinese encodings."""
+    for encoding in ("utf-8-sig", "utf-8", "gbk", "big5", "latin1"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
 def parse_cue(cue_path: str | Path) -> CueSheet:
     """Parse an existing CUE file and return a CueSheet object."""
     cue_path = Path(cue_path)
-    text = cue_path.read_text(encoding="utf-8-sig")
+    raw = cue_path.read_bytes()
+    text = _decode_cue_text(raw)
     lines = text.splitlines()
 
     performer = ""
@@ -441,3 +453,23 @@ def generate_cue_multidisc(discs: Iterable[CueSheet | _DiscDict]) -> str:
             global_track_number += 1
 
     return "\n".join(lines)
+
+
+def find_local_cue(audio_path: str | Path) -> Path | None:
+    """Locate a companion CUE sheet for ``audio_path``.
+
+    Checks, in order:
+
+    1. ``<audio_stem>.cue`` next to the audio file.
+    2. Any ``.cue`` file in the same directory whose name starts with the
+       audio file stem.
+
+    Returns ``None`` if no companion CUE sheet is found.
+    """
+    audio_path = Path(audio_path)
+    exact = audio_path.with_suffix(".cue")
+    if exact.exists():
+        return exact
+    for candidate in sorted(audio_path.parent.glob(f"{audio_path.stem}*.cue")):
+        return candidate
+    return None
