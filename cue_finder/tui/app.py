@@ -57,6 +57,85 @@ class FilePickerScreen(ModalScreen[str | None]):
             self.dismiss(None)
 
 
+class DiscSplitScreen(ModalScreen):
+    """Modal screen for selecting a disc range from a multi-disc album."""
+
+    DEFAULT_CSS = """
+    DiscSplitScreen {
+        align: center middle;
+    }
+    DiscSplitScreen > Vertical {
+        width: 70;
+        height: auto;
+        max-height: 80%;
+        border: thick $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    DiscSplitScreen DataTable {
+        height: auto;
+        max-height: 15;
+    }
+    """
+
+    def __init__(self, album, n_detected: int) -> None:
+        super().__init__()
+        self._album = album
+        self._n_detected = n_detected
+
+    def compose(self) -> ComposeResult:
+        n_meta = len(self._album.tracks)
+        with Vertical():
+            yield Label(
+                f"Track count mismatch: {n_meta} tracks in metadata vs "
+                f"{self._n_detected} segments detected."
+            )
+            yield Label("Select a track range (e.g. 1-10, 11-17) or 'a' for all:")
+            yield DataTable(id="disc_track_table")
+            yield Input(placeholder="e.g. 1-10", id="disc_range_input")
+            with Horizontal():
+                yield Button("OK", variant="primary", id="disc_ok_btn")
+                yield Button("Cancel", variant="default", id="disc_cancel_btn")
+
+    def on_mount(self) -> None:
+        from cue_finder.core.interactive import _suggest_disc_ranges
+
+        table = self.query_one("#disc_track_table", DataTable)
+        table.add_columns("#", "Title", "Duration")
+        for i, track in enumerate(self._album.tracks, 1):
+            dur = track.duration_sec or 0.0
+            mins = int(dur // 60)
+            secs = int(dur % 60)
+            table.add_row(str(i), track.title, f"{mins}:{secs:02d}")
+
+        suggestions = _suggest_disc_ranges(len(self._album.tracks), self._n_detected)
+        lines = []
+        for i, (label, start, end) in enumerate(suggestions, 1):
+            count = end - start + 1
+            marker = " <- matches detected" if count == self._n_detected else ""
+            lines.append(f"  {i}. {label}: tracks {start}-{end} ({count} tracks){marker}")
+        lines.append(f"  a. All {len(self._album.tracks)} tracks")
+        self.query_one("#disc_range_input", Input).value = "1"
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        from cue_finder.core.interactive import create_disc_subset, parse_range
+
+        if event.button.id == "disc_ok_btn":
+            text = self.query_one("#disc_range_input", Input).value.strip().lower()
+            if text == "a" or not text:
+                self.dismiss(self._album)
+                return
+            parsed = parse_range(text)
+            if parsed:
+                start, end = parsed
+                if 1 <= start <= end <= len(self._album.tracks):
+                    self.dismiss(create_disc_subset(self._album, start, end))
+                    return
+            self.dismiss(self._album)
+        else:
+            self.dismiss(None)
+
+
 class CueFinderApp(App[None]):
     """Interactive TUI for cue-finder."""
 
@@ -136,6 +215,8 @@ class CueFinderApp(App[None]):
         self._album_info: Optional["AlbumInfo"] = None
         self._sample_rate: int = 44100
         self._total_duration: float = 0.0
+        self._search_results: list = []  # Cached search results
+        self._scored: list = []  # Scored candidates from score_candidates()
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -166,7 +247,7 @@ class CueFinderApp(App[None]):
     def on_mount(self) -> None:
         """Initialize the TUI on mount."""
         results_table = self.query_one("#results_table", DataTable)
-        results_table.add_columns("Album", "Artist", "Year", "Tracks", "Source")
+        results_table.add_columns("Album", "Artist", "Year", "Tracks", "Source", "Score", "Flags")
         results_table.cursor_type = "row"
 
         track_table = self.query_one("#track_table", DataTable)
@@ -222,64 +303,155 @@ class CueFinderApp(App[None]):
             self.notify(f"Search failed: {exc}", severity="error")
             return
 
+        self._search_results = results
+        self._scored = []
+        if self._boundaries and self._total_duration > 0:
+            try:
+                from cue_finder.core.rank import score_candidates
+
+                self._scored = score_candidates(
+                    results, self._boundaries, self._total_duration, query
+                )
+            except Exception as exc:
+                self.notify(f"Scoring failed: {exc}", severity="error")
+
         table = self.query_one("#results_table", DataTable)
         table.clear()
         if not results:
             self.notify("No results found.", severity="information")
             return
 
-        for album in results:
-            table.add_row(
-                album.title,
-                album.artist,
-                album.date or "—",
-                str(len(album.tracks)),
-                album.source,
-            )
+        if self._scored:
+            for score in self._scored:
+                album = score.album
+                score_val = score.total_score
+                if score_val >= 0.6:
+                    score_str = f"[green]{score_val:.2f}[/green]"
+                elif score_val >= 0.4:
+                    score_str = f"[yellow]{score_val:.2f}[/yellow]"
+                else:
+                    score_str = f"[red]{score_val:.2f}[/red]"
+                flag_str = " ".join(score.flags) if score.flags else ""
+                table.add_row(
+                    album.title,
+                    album.artist,
+                    album.date or "—",
+                    str(len(album.tracks)),
+                    album.source,
+                    score_str,
+                    flag_str,
+                )
+        else:
+            for album in results:
+                table.add_row(
+                    album.title,
+                    album.artist,
+                    album.date or "—",
+                    str(len(album.tracks)),
+                    album.source,
+                    "—",
+                    "",
+                )
 
         self.notify(f"Found {len(results)} results.", title="Search")
 
     def _on_result_selected(self) -> None:
         table = self.query_one("#results_table", DataTable)
-        try:
-            row_key = table.coordinate_to_cell_key(table.cursor_coordinate)
-            row = table.get_row(row_key)
-        except Exception:
+
+        if self._scored:
+            try:
+                row_idx = table.cursor_coordinate[0]
+                if 0 <= row_idx < len(self._scored):
+                    self._album_info = self._scored[row_idx].album
+                    self._check_disc_split()
+            except Exception:
+                pass
+        elif self._search_results:
+            try:
+                row_idx = table.cursor_coordinate[0]
+                if 0 <= row_idx < len(self._search_results):
+                    self._album_info = self._search_results[row_idx]
+                    self._check_disc_split()
+            except Exception:
+                pass
+
+    def _check_disc_split(self) -> None:
+        from cue_finder.core.interactive import should_split_disc
+
+        if not self._album_info:
             return
+        n_detected = len(self._boundaries) + 1 if self._boundaries else 0
+        if n_detected > 0 and should_split_disc(self._album_info, n_detected):
+            self.push_screen(
+                DiscSplitScreen(self._album_info, n_detected),
+                self._on_disc_split,
+            )
+        else:
+            self._populate_track_list()
 
-        from cue_finder.core.search import search_album, AlbumInfo
+    def _on_disc_split(self, result) -> None:
+        if result is not None:
+            self._album_info = result
+            self.notify(
+                f"Selected {len(result.tracks)} tracks from multi-disc album",
+                title="Disc Split",
+            )
+        self._populate_track_list()
 
-        query = self.query_one("#search_input", Input).value.strip()
-        try:
-            results = search_album(query)
-            if results and row:
-                idx = min(row.index, len(results) - 1)
-                self._album_info = results[idx]
-                self._populate_track_list()
-        except Exception:
-            pass
 
     def _populate_track_list(self) -> None:
+        from cue_finder.core.match import TrackMatcher
+
         if not self._album_info:
             return
 
         track_table = self.query_one("#track_table", DataTable)
         track_table.clear()
 
-        total_dur = self._total_duration or 1.0
-        track_count = len(self._album_info.tracks)
-        dur_per_track = total_dur / track_count if track_count else 0.0
+        track_durations = [t.duration_sec or 0.0 for t in self._album_info.tracks]
+        track_titles = [t.title for t in self._album_info.tracks]
+        track_artists = [
+            t.artist or self._album_info.artist for t in self._album_info.tracks
+        ]
 
-        for i, track in enumerate(self._album_info.tracks):
-            start = i * dur_per_track
-            track_table.add_row(
-                str(i + 1),
-                track.title,
-                f"{start:.1f}s",
-                f"{(i + 1) * dur_per_track:.1f}s",
-                f"{track.duration_sec or dur_per_track:.1f}s",
-                "—",
-            )
+        matches = None
+        if self._boundaries and self._total_duration > 0:
+            try:
+                matcher = TrackMatcher()
+                matches = matcher.match(
+                    self._boundaries,
+                    track_durations,
+                    track_titles,
+                    track_artists,
+                    self._total_duration,
+                )
+            except Exception:
+                matches = None
+
+        if matches:
+            for m in matches:
+                track_table.add_row(
+                    str(m.number),
+                    m.title,
+                    f"{m.start:.1f}s",
+                    f"{m.end:.1f}s",
+                    f"{m.actual_duration:.1f}s",
+                    f"{m.confidence:.2f}",
+                )
+        else:
+            total_dur = self._total_duration or 1.0
+            track_count = len(self._album_info.tracks)
+            dur_per_track = total_dur / track_count if track_count else 0.0
+            for i, track in enumerate(self._album_info.tracks):
+                start = i * dur_per_track
+                track_table.add_row(
+                    str(i + 1),
+                    track.title,
+                    f"{start:.1f}s",
+                    f"{(i + 1) * dur_per_track:.1f}s",
+                    f"{track.duration_sec or dur_per_track:.1f}s",
+                    "—",
+                )
 
         self._update_cue_preview()
 
@@ -331,7 +503,7 @@ class CueFinderApp(App[None]):
             album_artist=self._album_info.artist,
             album_title=self._album_info.title,
             audio_filename=Path(self._audio_path).name,
-            tracks=tracks,
+            matched_tracks=tracks,
         )
 
         cue_log = self.query_one("#cue_preview", RichLog)
@@ -389,7 +561,7 @@ class CueFinderApp(App[None]):
                 album_artist=album.artist,
                 album_title=album.title,
                 audio_filename=audio_name,
-                tracks=cue_tracks,
+                matched_tracks=cue_tracks,
             )
             cue_path = out_dir / f"{Path(self._audio_path).stem}.cue"
             write_cue(cue_text, str(cue_path))

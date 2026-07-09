@@ -99,18 +99,20 @@ pip install -e ".[dev]"
 
 The project is organized into focused modules:
 
-| Module      | Path                           | Responsibility                                                                                   |
-|-------------|--------------------------------|--------------------------------------------------------------------------------------------------|
-| `silence`   | `cue_finder/core/silence.py`   | Silence-based track boundary detection using the audio-slicer RMS algorithm.                     |
-| `search`    | `cue_finder/core/search.py`    | Multi-source metadata lookup (MusicBrainz, iTunes, NetEase, Discogs, Deezer, GNDB).              |
-| `match`     | `cue_finder/core/match.py`     | Dynamic Time Warping (DTW) and greedy fallback to match detected segments to metadata durations. |
-| `cue`       | `cue_finder/core/cue.py`       | CUE sheet generation, parsing, and validation.                                                   |
-| `split`     | `cue_finder/core/split.py`     | Audio format detection and orchestration of FLAC/WAV/APE splitting backends.                     |
-| `tag`       | `cue_finder/core/tag.py`       | Metadata tagging via cuetag, mutagen fallback, and optional beets import.                        |
-| `tracklist` | `cue_finder/core/tracklist.py` | YAML/text tracklist parsing, validation, and export.                                             |
-| `cli`       | `cue_finder/cli.py`            | Typer-based command-line interface with dual TTY/TUI mode.                                       |
-| `tui`       | `cue_finder/tui/`              | Textual-based interactive interface (launched automatically in a TTY).                           |
-| Backends    | `cue_finder/backends/`         | Format-specific splitting implementations: `flac_splitter`, `wav_splitter`, `ape_splitter`.      |
+| Module       | Path                           | Responsibility                                                                                   |
+|--------------|--------------------------------|--------------------------------------------------------------------------------------------------|
+| `silence`    | `cue_finder/core/silence.py`   | Silence-based track boundary detection using the audio-slicer RMS algorithm.                     |
+| `search`     | `cue_finder/core/search.py`    | Multi-source metadata lookup (MusicBrainz, iTunes, NetEase, Discogs, Deezer, GNDB).              |
+| `rank`       | `cue_finder/core/rank.py`      | Multi-signal candidate scoring: text similarity, DTW duration alignment, track count, fingerprint. |
+| `match`      | `cue_finder/core/match.py`     | Dynamic Time Warping (DTW) and greedy fallback to match detected segments to metadata durations. |
+| `interactive`| `cue_finder/core/interactive.py` | Interactive candidate selection with conditional prompting, detail preview, and multi-disc splitting. |
+| `cue`        | `cue_finder/core/cue.py`       | CUE sheet generation, parsing, and validation.                                                   |
+| `split`      | `cue_finder/core/split.py`     | Audio format detection and orchestration of FLAC/WAV/APE splitting backends.                     |
+| `tag`        | `cue_finder/core/tag.py`       | Metadata tagging via cuetag, mutagen fallback, and optional beets import.                        |
+| `tracklist`  | `cue_finder/core/tracklist.py` | YAML/text tracklist parsing, validation, and export.                                             |
+| `cli`        | `cue_finder/cli.py`            | Typer-based command-line interface with dual TTY/TUI mode.                                       |
+| `tui`        | `cue_finder/tui/`              | Textual-based interactive interface (launched automatically in a TTY).                           |
+| Backends     | `cue_finder/backends/`         | Format-specific splitting implementations: `flac_splitter`, `wav_splitter`, `ape_splitter`.      |
 
 ## External binary dependencies
 
@@ -279,10 +281,10 @@ When used with `run` or `generate`, the durations and boundary information impro
 |------------|----------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `search`   | Search album metadata across online sources.                               | `query`, `--source`, `--json`                                                                                                                                                              |
 | `detect`   | Detect track boundaries via silence detection.                             | `-i`, `--threshold`, `--min-length`, `--min-interval`, `--hop-size`, `--max-sil-kept`, `-o`                                                                                                |
-| `generate` | Generate a CUE sheet from detected boundaries and metadata or a tracklist. | `-i`, `--tracklist`, `--search`, `-o`                                                                                                                                                      |
+| `generate` | Generate a CUE sheet from detected boundaries and metadata or a tracklist. | `-i`, `--tracklist`, `--search`, `--release-id`, `-o`                                                                                                                                      |
 | `split`    | Split an audio file into individual tracks.                                | `-i`, `-c`, `--timestamps`, `-o`, `--format`, `--name-template`                                                                                                                            |
 | `tag`      | Tag split audio files with metadata from a CUE sheet.                      | `-d`, `-c`, `--beets/--no-beets`, `--beets-config`, `--beets-mode`                                                                                                                         |
-| `run`      | Full pipeline: detect → search → match → generate CUE → split → tag.       | `-i`, `--search`, `--tracklist`, `-o`, `--format`, `--threshold`, `--min-length`, `--min-interval`, `--hop-size`, `--max-sil-kept`, `--beets/--no-beets`, `--beets-config`, `--beets-mode` |
+| `run`      | Full pipeline: detect → search → match → generate CUE → split → tag.       | `-i`, `--search`, `--tracklist`, `--release-id`, `-o`, `--format`, `--threshold`, `--min-length`, `--min-interval`, `--hop-size`, `--max-sil-kept`, `--beets/--no-beets`, `--beets-config`, `--beets-mode` |
 | `tui`      | Launch the interactive Textual TUI.                                        | none                                                                                                                                                                                       |
 
 ### Global options
@@ -300,6 +302,7 @@ cue-finder run -i album.flac --search "Artist Album" -o ./tracks/ --format flac
 - `-i`, `--input`: path to the source audio file (FLAC/WAV/APE).
 - `--search`: free-text album query; the first returned match is used.
 - `--tracklist`: path to a YAML tracklist file; overrides `--search` if both are provided.
+- `--release-id`: directly fetch an album by `source:id` (e.g. `netease:12345`, `musicbrainz:mbid`); bypasses search and scoring. Use `cue-finder search` to find the correct ID first.
 - `-o`, `--output`: directory for the split tracks and generated CUE sheet.
 - `--format`: output audio format (`flac` or `wav`). Defaults to the input format.
 - `--threshold`: silence threshold in dB (default `-40.0`).
@@ -343,6 +346,79 @@ To force non-interactive mode in scripts:
 cue-finder --no-interactive run -i album.flac --search "Artist Album" -o ./tracks/
 ```
 
+## Interactive candidate selection
+
+When the metadata search returns ambiguous results (low confidence score, close competitors, or track count mismatch), cue-finder automatically prompts you to choose from a ranked candidate list instead of blindly auto-selecting the top result.
+
+### When does the prompt appear?
+
+The interactive prompt triggers when any of these conditions are met:
+
+- Top candidate score is below 0.50 (low confidence).
+- The top two candidates are within 0.10 of each other (strong competition).
+- The top candidate has warning flags (track count or duration mismatch).
+
+You can override this behavior with global flags:
+
+- `--interactive`: always prompt, even for high-confidence matches.
+- `--no-interactive`: never prompt, always auto-select the top candidate.
+
+### The selection interface
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Candidates for "S.H.E Play"  (10 tracks, 40:00)    │
+├────┬──────────┬──────────┬──────┬──────┬──────┬─────┤
+│ #  │ Artist   │ Album    │ Year │ Trk  │ Src  │ Score│
+├────┼──────────┼──────────┼──────┼──────┼──────┼─────┤
+│ 1  │ S.H.E    │ Play     │ 2007 │   11 │itunes│ 0.42│
+│ 2  │ S.H.E    │ Play(豪华)│ 2007 │   12 │netease│0.39│
+└────┴──────────┴──────────┴──────┴──────┴──────┴─────┘
+
+Select [1-2], (d)etail, (s)kip, (m)anual, (q)uit (1):
+```
+
+- **Number**: select that candidate.
+- **d**: view track-by-track alignment detail (expected vs actual duration, confidence).
+- **s**: skip selection, use numbered tracks.
+- **m**: enter a new search query and re-search.
+- **q**: abort.
+
+### Direct fetch with `--release-id`
+
+When search consistently returns wrong results (e.g. short or generic album titles), you can bypass search entirely by specifying a known source ID:
+
+```bash
+# First, find the correct ID
+cue-finder search "S.H.E Play" --json
+
+# Then fetch directly
+cue-finder run -i album.flac --release-id itunes:456173869 -o ./tracks/
+```
+
+This skips the search and scoring pipeline entirely, fetching the exact album from the specified source.
+
+### Multi-disc album splitting
+
+When you select a candidate whose track count significantly exceeds the number of detected segments (e.g. a combined CD1+CD2 release with 17 tracks, but only 10 segments detected), cue-finder offers a disc-range selection:
+
+```
+⚠ Track count mismatch: Album has 17 tracks, but 10 segments detected.
+This may be a multi-disc album. Select a track subset.
+
+  1. Disc 1: tracks 1-10 (10 tracks) <- matches detected
+  2. Disc 2: tracks 11-17 (7 tracks)
+  3. First half: tracks 1-8 (8 tracks)
+  4. Second half: tracks 9-17 (9 tracks)
+  a. All 17 tracks
+
+Select [1-N], enter range (e.g. 3-12), or 'a' (1):
+```
+
+You can pick a suggestion by number, type a custom range (e.g. `11-17`), or select `a` to keep all tracks. The selected subset is then used for track matching and CUE generation.
+
+In the TUI, this appears as a modal dialog with a full track listing and a range input field.
+
 ## Metadata sources
 
 Default search cascade (first source with usable results wins):
@@ -374,6 +450,25 @@ cue-finder run -i album.flac --search "Artist Album" -o ./tracks/
 ```bash
 cue-finder search "Artist Album" --json
 cue-finder run -i album.flac --search "Artist Album" -o ./tracks/
+```
+
+### Direct fetch by release ID
+
+When search returns wrong results for short or generic album titles:
+
+```bash
+cue-finder search "Artist Album" --json          # find the correct source:id
+cue-finder run -i album.flac --release-id itunes:456173869 -o ./tracks/
+```
+
+### Multi-disc album workflow
+
+When the album is a combined CD1+CD2 release but you only have one disc's audio file:
+
+```bash
+# Search finds the combined version (17 tracks)
+cue-finder run -i forever_cd1.flac --search "S.H.E Forever" -o ./tracks/
+# Interactive prompt offers disc-range selection -> pick "Disc 1: tracks 1-10"
 ```
 
 ### Manual tracklist workflow

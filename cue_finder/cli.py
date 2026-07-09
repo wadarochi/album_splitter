@@ -28,6 +28,8 @@ EXIT_FAILURE = 2
 EXIT_INVALID_ARGS = 3
 EXIT_MISSING_DEPS = 4
 
+_interactive_mode: bool | None = None
+
 
 def _setup_logging(verbose: bool, quiet: bool) -> None:
     if quiet:
@@ -57,6 +59,8 @@ def callback(
     ),
 ) -> None:
     """cue-finder: Split single-file CD rips into individual tracks with metadata tagging."""
+    global _interactive_mode
+    _interactive_mode = interactive
     _setup_logging(verbose, quiet)
 
 
@@ -178,15 +182,17 @@ def generate(
     search_query: Optional[str] = typer.Option(None, "--search", help="Search query for metadata lookup."),
     output: str = typer.Option(..., "-o", "--output", help="Output CUE file path."),
     source: Optional[str] = typer.Option(None, "--source", "-s", help="Metadata source(s), comma-separated (musicbrainz,itunes,netease,discogs,deezer,gnudb)."),
+    release_id: Optional[str] = typer.Option(None, "--release-id", help="Directly fetch by source:id (e.g. netease:12345, musicbrainz:mbid)."),
     no_local_cue: bool = typer.Option(False, "--no-local-cue", help="Ignore local CUE sheets and force search."),
     acoustid: bool = typer.Option(True, "--acoustid/--no-acoustid", help="Use AcoustID fingerprinting when ACOUSTID_API_KEY is set."),
 ) -> None:
     """Generate a CUE sheet from detected boundaries and metadata."""
     from cue_finder.core.cue import CueTrack, find_local_cue, generate_cue, parse_cue, seconds_to_msf, write_cue
+    from cue_finder.core.interactive import SelectionAborted, select_album
     from cue_finder.core.match import TrackMatcher
     from cue_finder.core.rank import score_candidates
     from cue_finder.core.silence import SilenceDetector
-    from cue_finder.core.search import fingerprint_file_with_ids, search_album
+    from cue_finder.core.search import fetch_album, fingerprint_file_with_ids, search_album
     from cue_finder.core.tracklist import detect_format, load_tracklist, parse_plain_text
     import soundfile
 
@@ -237,6 +243,23 @@ def generate(
             track_artists = [""] * len(tl.tracks)
             album_artist = ""
             album_title = ""
+    elif release_id:
+        parts = release_id.split(":", 1)
+        if len(parts) != 2:
+            console.print(Panel("--release-id must be in source:id format (e.g. netease:12345)", title="Error", border_style="red"))
+            raise typer.Exit(EXIT_INVALID_ARGS)
+        src, aid = parts[0].strip(), parts[1].strip()
+        console.print(f"  Fetching {src}:{aid}...")
+        album = fetch_album(src, aid)
+        if not album or not album.tracks:
+            console.print(f"[yellow]No album found for {src}:{aid}[/yellow]")
+            raise typer.Exit(EXIT_PARTIAL)
+        console.print(f"  Matched: {album.artist} — {album.title} ({album.source})")
+        track_titles = [t.title for t in album.tracks]
+        track_durations = [t.duration_sec for t in album.tracks]
+        track_artists = [t.artist or album.artist for t in album.tracks]
+        album_artist = album.artist
+        album_title = album.title
     elif search_query:
         sources = [s.strip() for s in source.split(",") if s.strip()] if source else None
         results = search_album(search_query, sources=sources)
@@ -259,17 +282,26 @@ def generate(
             console.print("[yellow]No metadata found for query.[/yellow]")
             raise typer.Exit(EXIT_PARTIAL)
         scored = score_candidates(results, boundaries, total_duration, search_query, fingerprint_release_ids=fingerprint_release_ids)
-        album = scored[0].album
-        console.print(f"  Matched: {album.artist} — {album.title} ({album.source}, score={scored[0].total_score:.2f})")
-        if len(scored) > 1:
-            console.print("  Alternatives:")
-            for alt in scored[1:4]:
-                console.print(f"    - {alt.album.artist} — {alt.album.title} ({alt.album.source}, score={alt.total_score:.2f})")
-        track_titles = [t.title for t in album.tracks]
-        track_durations = [t.duration_sec for t in album.tracks]
-        track_artists = [t.artist or album.artist for t in album.tracks]
-        album_artist = album.artist
-        album_title = album.title
+        try:
+            album = select_album(scored, _interactive_mode, search_query, boundaries, total_duration, console=console)
+        except SelectionAborted:
+            console.print("[yellow]Selection aborted.[/yellow]")
+            raise typer.Exit(EXIT_PARTIAL)
+        if album is None:
+            console.print("[yellow]No album selected. Using numbered tracks.[/yellow]")
+            n = len(boundaries) + 1
+            track_titles = [f"Track {i:02d}" for i in range(1, n + 1)]
+            track_durations = [total_duration / n] * n
+            track_artists = [""] * n
+            album_artist = ""
+            album_title = input_path.stem
+        else:
+            console.print(f"  Selected: {album.artist} — {album.title} ({album.source})")
+            track_titles = [t.title for t in album.tracks]
+            track_durations = [t.duration_sec for t in album.tracks]
+            track_artists = [t.artist or album.artist for t in album.tracks]
+            album_artist = album.artist
+            album_title = album.title
     else:
         console.print(Panel("Provide --tracklist or --search", title="Error", border_style="red"))
         raise typer.Exit(EXIT_INVALID_ARGS)
@@ -421,6 +453,7 @@ def run(
     output_dir: str = typer.Option(..., "-o", "--output", help="Output directory."),
     format: Optional[str] = typer.Option(None, "--format", help="Output audio format."),
     source: Optional[str] = typer.Option(None, "--source", "-s", help="Metadata source(s), comma-separated (musicbrainz,itunes,netease,discogs,deezer,gnudb)."),
+    release_id: Optional[str] = typer.Option(None, "--release-id", help="Directly fetch by source:id (e.g. netease:12345, musicbrainz:mbid)."),
     threshold: float = typer.Option(-40.0, "--threshold", help="Silence threshold in dB."),
     min_length: int = typer.Option(5000, "--min-length", help="Minimum track length in ms."),
     min_interval: int = typer.Option(300, "--min-interval", help="Minimum silence interval in ms."),
@@ -438,10 +471,11 @@ def run(
     import soundfile
     from cue_finder.core.cleanup import cleanup_tracks
     from cue_finder.core.cue import CueTrack, find_local_cue, generate_cue, parse_cue, seconds_to_msf, write_cue
+    from cue_finder.core.interactive import SelectionAborted, select_album
     from cue_finder.core.match import TrackMatcher
     from cue_finder.core.rank import score_candidates
     from cue_finder.core.silence import SilenceDetector
-    from cue_finder.core.search import fingerprint_file_with_ids, search_album
+    from cue_finder.core.search import fetch_album, fingerprint_file_with_ids, search_album
     from cue_finder.core.split import Splitter
     from cue_finder.core.tag import tag_tracks
     from cue_finder.core.tracklist import detect_format, load_tracklist, parse_plain_text
@@ -500,6 +534,29 @@ def run(
             track_artists = [""] * len(tl.tracks)
             album_artist = ""
             album_title = ""
+    elif release_id:
+        parts = release_id.split(":", 1)
+        if len(parts) != 2:
+            console.print(Panel("--release-id must be in source:id format (e.g. netease:12345)", title="Error", border_style="red"))
+            raise typer.Exit(EXIT_INVALID_ARGS)
+        src, aid = parts[0].strip(), parts[1].strip()
+        console.print(f"  Fetching {src}:{aid}...")
+        album = fetch_album(src, aid)
+        if not album or not album.tracks:
+            console.print(f"[yellow]No album found for {src}:{aid}. Using numbered tracks.[/yellow]")
+            n = len(boundaries) + 1
+            track_titles = [f"Track {i:02d}" for i in range(1, n + 1)]
+            track_durations = [total_duration / n] * n
+            track_artists = [""] * n
+            album_artist = ""
+            album_title = input_path.stem
+        else:
+            console.print(f"  Matched: {album.artist} — {album.title} ({album.source})")
+            track_titles = [t.title for t in album.tracks]
+            track_durations = [t.duration_sec for t in album.tracks]
+            track_artists = [t.artist or album.artist for t in album.tracks]
+            album_artist = album.artist
+            album_title = album.title
     elif search_query:
         sources = [s.strip() for s in source.split(",") if s.strip()] if source else None
         results = search_album(search_query, sources=sources)
@@ -528,18 +585,26 @@ def run(
             album_title = input_path.stem
         else:
             scored = score_candidates(results, boundaries, total_duration, search_query, fingerprint_release_ids=fingerprint_release_ids)
-            album = scored[0].album
-            console.print(f"  Matched: {album.artist} — {album.title} ({album.source}, score={scored[0].total_score:.2f})")
-            if len(scored) > 1:
-                console.print("  Alternatives:")
-                for alt in scored[1:4]:
-                    flag_str = f", flags={alt.flags}" if alt.flags else ""
-                    console.print(f"    - {alt.album.artist} — {alt.album.title} ({alt.album.source}, score={alt.total_score:.2f}{flag_str})")
-            track_titles = [t.title for t in album.tracks]
-            track_durations = [t.duration_sec for t in album.tracks]
-            track_artists = [t.artist or album.artist for t in album.tracks]
-            album_artist = album.artist
-            album_title = album.title
+            try:
+                album = select_album(scored, _interactive_mode, search_query, boundaries, total_duration, console=console)
+            except SelectionAborted:
+                console.print("[yellow]Selection aborted.[/yellow]")
+                raise typer.Exit(EXIT_PARTIAL)
+            if album is None:
+                console.print("[yellow]No album selected. Using numbered tracks.[/yellow]")
+                n = len(boundaries) + 1
+                track_titles = [f"Track {i:02d}" for i in range(1, n + 1)]
+                track_durations = [total_duration / n] * n
+                track_artists = [""] * n
+                album_artist = ""
+                album_title = input_path.stem
+            else:
+                console.print(f"  Selected: {album.artist} — {album.title} ({album.source})")
+                track_titles = [t.title for t in album.tracks]
+                track_durations = [t.duration_sec for t in album.tracks]
+                track_artists = [t.artist or album.artist for t in album.tracks]
+                album_artist = album.artist
+                album_title = album.title
     else:
         n = len(boundaries) + 1
         track_titles = [f"Track {i:02d}" for i in range(1, n + 1)]
