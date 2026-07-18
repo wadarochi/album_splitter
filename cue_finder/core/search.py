@@ -8,9 +8,15 @@ import re
 import time
 import urllib.parse
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 import requests
+
+
+class SearchTierResult(NamedTuple):
+    tier: int
+    albums: list[AlbumInfo]
+    suggestions: list[str]
 
 musicbrainzngs: Any = None
 try:
@@ -980,3 +986,90 @@ def fingerprint_file_with_ids(file_path: str) -> tuple[list[AlbumInfo], set[str]
         if album and album.tracks and all(t.duration_sec is not None for t in album.tracks):
             albums.append(album)
     return albums, release_ids
+
+
+def _extract_year_from_query(query: str) -> str | None:
+    """Extract a 4-digit year from the query if present."""
+    match = re.search(r"\b(19|20)\d{2}\b", query)
+    return match.group(0) if match else None
+
+
+def _extract_barcode_from_query(query: str) -> str | None:
+    """Extract a barcode (8-13 digits) from the query if present."""
+    match = re.search(r"\b\d{8,13}\b", query)
+    return match.group(0) if match else None
+
+
+def _extract_catalog_from_query(query: str) -> str | None:
+    """Extract a catalog number (alphanumeric with hyphens) from the query if present."""
+    # Common catalog patterns: ABC-123, ABC123, 123-4567890
+    match = re.search(r"\b[A-Z]{2,5}[-]?\d{3,8}\b", query, re.IGNORECASE)
+    return match.group(0) if match else None
+
+
+def _generate_refinement_suggestions(query: str, albums: list[AlbumInfo]) -> list[str]:
+    """Generate query refinement suggestions based on signal divergence."""
+    suggestions = []
+    
+    # Suggest adding year if multiple albums have different years
+    years = [a.date[:4] for a in albums if a.date and len(a.date) >= 4]
+    if len(set(years)) > 1:
+        suggestions.append(f"{query} {years[0]}" if years else f"{query} <year>")
+    
+    # Suggest adding source if multiple sources returned results
+    sources = list(set(a.source for a in albums))
+    if len(sources) > 1:
+        suggestions.append(f"{query} --source {sources[0]}")
+    
+    # Suggest adding track name if query is very short
+    if len(query.split()) <= 2:
+        suggestions.append(f"{query} <track-name>")
+    
+    return suggestions[:3]  # Limit to 3 suggestions
+
+
+def search_album_progressive(
+    query: str,
+    sources: list[str] | None = None,
+    file_path: str | None = None,
+) -> SearchTierResult:
+    """Progressive search with three tiers of specificity.
+    
+    Tier 1: Exact ID Lookup (barcode/ISRC/catalog/source:id in query)
+    Tier 2: Text Search with Signal Extraction
+    Tier 3: Ambiguous Result with Suggestions
+    
+    Args:
+        query: Free-text query string, may contain identifiers.
+        sources: Optional ordered list of source names.
+        file_path: Optional audio file path for AcoustID fingerprinting.
+    
+    Returns:
+        SearchTierResult with tier number, albums, and refinement suggestions.
+    """
+    # Tier 1: Check for exact identifiers in query
+    barcode = _extract_barcode_from_query(query)
+    catalog = _extract_catalog_from_query(query)
+    
+    # Check for source:id format
+    if ":" in query and not query.startswith("http"):
+        parts = query.split(":", 1)
+        if len(parts) == 2 and parts[0] in DEFAULT_SOURCES:
+            album = fetch_album(parts[0], parts[1])
+            if album:
+                return SearchTierResult(tier=1, albums=[album], suggestions=[])
+    
+    # Tier 2: Standard text search with signal extraction
+    albums = search_album(query, sources=sources)
+    
+    if not albums:
+        return SearchTierResult(tier=3, albums=[], suggestions=[query])
+    
+    # If we have a single strong match, return it
+    if len(albums) == 1:
+        return SearchTierResult(tier=2, albums=albums, suggestions=[])
+    
+    # Generate refinement suggestions for ambiguous results
+    suggestions = _generate_refinement_suggestions(query, albums)
+    
+    return SearchTierResult(tier=3, albums=albums, suggestions=suggestions)

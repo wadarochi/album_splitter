@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import dataclass
 from typing import Callable
 
 from rich.console import Console
@@ -23,6 +24,18 @@ _DISC_SPLIT_MIN_DIFF = 3
 
 class SelectionAborted(Exception):
     """User aborted the selection process."""
+
+
+
+@dataclass
+class SearchRefinement:
+    query: str
+
+
+@dataclass
+class DirectId:
+    source: str
+    source_id: str
 
 
 def should_prompt(scored: list[AlbumScore]) -> bool:
@@ -88,7 +101,7 @@ def select_album(
     total_duration: float,
     console: Console | None = None,
     search_fn: Callable[[str], list[AlbumScore]] | None = None,
-) -> AlbumInfo | None:
+) -> AlbumInfo | SearchRefinement | DirectId | None:
     """Select the best album candidate, optionally prompting the user."""
     if not scored:
         raise ValueError("No candidates to select from.")
@@ -106,8 +119,8 @@ def select_album(
         return scored[0].album
 
     album = _interactive_loop(scored, query, boundaries, total_duration, console, search_fn)
-    if album is None:
-        return None
+    if album is None or isinstance(album, (SearchRefinement, DirectId)):
+        return album
 
     n_detected = len(boundaries) + 1 if boundaries else 0
     if n_detected > 0:
@@ -123,12 +136,12 @@ def _interactive_loop(
     total_duration: float,
     console: Console,
     search_fn: Callable[[str], list[AlbumScore]] | None,
-) -> AlbumInfo | None:
+) -> AlbumInfo | SearchRefinement | DirectId | None:
     while True:
         _display_candidates(scored, query, boundaries, total_duration, console)
 
         n = min(len(scored), _MAX_DISPLAY)
-        prompt = f"Select [1-{n}], (d)etail, (s)kip, (m)anual, (q)uit"
+        prompt = f"Select [1-{n}], (d)etail, (s)kip, (m)anual, (e)nter search, (i)d, (q)uit"
         selection = Prompt.ask(prompt, default="1")
         selection = selection.strip().lower()
 
@@ -151,6 +164,22 @@ def _interactive_loop(
             if new_scored:
                 scored = new_scored
                 query = new_query
+            continue
+
+
+        if selection in ("e", "enter", "enter search"):
+            new_query = Prompt.ask("Enter new search query", default=query)
+            if new_query and new_query != query:
+                return SearchRefinement(query=new_query)
+            continue
+
+        if selection in ("i", "id", "enter id"):
+            id_input = Prompt.ask("Enter source:id (e.g., netease:12345)")
+            if ":" in id_input:
+                source, source_id = id_input.split(":", 1)
+                if source and source_id:
+                    return DirectId(source=source, source_id=source_id)
+            console.print("[red]Invalid format. Use source:id (e.g., netease:12345)[/red]")
             continue
 
         if selection in ("q", "quit"):

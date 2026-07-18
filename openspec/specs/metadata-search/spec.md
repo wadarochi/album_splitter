@@ -93,3 +93,49 @@ The system SHALL optionally support AcoustID/Chromaprint fingerprinting to ident
 #### Scenario: Fingerprint yields no match
 - **WHEN** the fingerprint does not match any recording in AcoustID
 - **THEN** the system SHALL fall back to text-based search
+
+
+### Requirement: Interactive search refinement
+The system SHALL support interactive query refinement when search results are ambiguous or low-confidence. Users SHALL be able to enter a new search query or specify a direct source ID during the interactive selection process.
+
+#### Scenario: Enter new search query
+- **WHEN** the user selects "(e)nter search" at the interactive prompt
+- **THEN** the system SHALL prompt for a new query, return a `SearchRefinement` object, and the caller SHALL re-run the search with the new query
+
+#### Scenario: Enter direct source ID
+- **WHEN** the user selects "(i)d" at the interactive prompt
+- **THEN** the system SHALL prompt for a source:id pair (e.g., "netease:12345"), return a `DirectId` object, and the caller SHALL fetch the specified album directly
+
+#### Scenario: Invalid source ID format
+- **WHEN** the user enters an invalid source ID format (missing colon or unknown source)
+- **THEN** the system SHALL display an error message and return to the interactive prompt
+
+### Requirement: Progressive search strategy
+The system SHALL implement a progressive search strategy with three tiers: Tier 1 (exact ID lookup), Tier 2 (text search with signal extraction), and Tier 3 (ambiguous results with refinement suggestions).
+
+#### Scenario: Direct source ID in query
+- **WHEN** the query contains a source:id pair (e.g., "netease:12345")
+- **THEN** the system SHALL bypass search and fetch the album directly (Tier 1)
+
+#### Scenario: Ambiguous results with suggestions
+- **WHEN** text search returns multiple results with different years or sources
+- **THEN** the system SHALL return Tier 3 with refinement suggestions (e.g., add year, specify source, add track name)
+
+#### Scenario: Single strong match
+- **WHEN** text search returns exactly one result
+- **THEN** the system SHALL return Tier 2 with the single album and no suggestions
+
+### Requirement: Disambiguation signal extraction
+The system SHALL extract disambiguation signals from queries and album metadata to help users refine their searches. Signals include year, barcode, catalog number, track name similarity, country hint, and source disambiguation comments.
+
+#### Scenario: Year extraction from query
+- **WHEN** the query contains a 4-digit year (e.g., "S.H.E Play 2007")
+- **THEN** the system SHALL extract the year and use it for matching and refinement suggestions
+
+#### Scenario: Barcode extraction from query
+- **WHEN** the query contains an 8-13 digit barcode
+- **THEN** the system SHALL extract the barcode for potential exact matching
+
+#### Scenario: Catalog number extraction from query
+- **WHEN** the query contains a catalog number pattern (e.g., "EMI-12345")
+- **THEN** the system SHALL extract the catalog number for potential exact matching

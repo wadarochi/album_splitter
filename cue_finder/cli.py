@@ -188,7 +188,7 @@ def generate(
 ) -> None:
     """Generate a CUE sheet from detected boundaries and metadata."""
     from cue_finder.core.cue import CueTrack, find_local_cue, generate_cue, parse_cue, seconds_to_msf, write_cue
-    from cue_finder.core.interactive import SelectionAborted, select_album
+    from cue_finder.core.interactive import DirectId, SearchRefinement, SelectionAborted, select_album
     from cue_finder.core.match import TrackMatcher
     from cue_finder.core.rank import score_candidates
     from cue_finder.core.silence import SilenceDetector
@@ -287,6 +287,23 @@ def generate(
         except SelectionAborted:
             console.print("[yellow]Selection aborted.[/yellow]")
             raise typer.Exit(EXIT_PARTIAL)
+
+        if isinstance(album, SearchRefinement):
+            console.print(f"  Re-searching: {album.query}")
+            results = search_album(album.query, sources=sources if source else None)
+            if not results:
+                console.print("[yellow]No metadata found for refined query.[/yellow]")
+                raise typer.Exit(EXIT_PARTIAL)
+            scored = score_candidates(results, boundaries, total_duration, album.query, fingerprint_release_ids=fingerprint_release_ids)
+            album = scored[0].album
+            console.print(f"  Auto-selected: {album.artist} — {album.title} ({album.source})")
+        elif isinstance(album, DirectId):
+            console.print(f"  Fetching {album.source}:{album.source_id}...")
+            album = fetch_album(album.source, album.source_id)
+            if not album or not album.tracks:
+                console.print("[yellow]No album found for the specified ID.[/yellow]")
+                raise typer.Exit(EXIT_PARTIAL)
+
         if album is None:
             console.print("[yellow]No album selected. Using numbered tracks.[/yellow]")
             n = len(boundaries) + 1
@@ -471,7 +488,7 @@ def run(
     import soundfile
     from cue_finder.core.cleanup import cleanup_tracks
     from cue_finder.core.cue import CueTrack, find_local_cue, generate_cue, parse_cue, seconds_to_msf, write_cue
-    from cue_finder.core.interactive import SelectionAborted, select_album
+    from cue_finder.core.interactive import DirectId, SearchRefinement, SelectionAborted, select_album
     from cue_finder.core.match import TrackMatcher
     from cue_finder.core.rank import score_candidates
     from cue_finder.core.silence import SilenceDetector
@@ -590,6 +607,36 @@ def run(
             except SelectionAborted:
                 console.print("[yellow]Selection aborted.[/yellow]")
                 raise typer.Exit(EXIT_PARTIAL)
+
+            if isinstance(album, SearchRefinement):
+                console.print(f"  Re-searching: {album.query}")
+                results = search_album(album.query, sources=sources if source else None)
+                if not results:
+                    console.print("[yellow]No metadata found for refined query. Using numbered tracks.[/yellow]")
+                    n = len(boundaries) + 1
+                    track_titles = [f"Track {i:02d}" for i in range(1, n + 1)]
+                    track_durations = [total_duration / n] * n
+                    track_artists = [""] * n
+                    album_artist = ""
+                    album_title = input_path.stem
+                    album = None
+                else:
+                    scored = score_candidates(results, boundaries, total_duration, album.query, fingerprint_release_ids=fingerprint_release_ids)
+                    album = scored[0].album
+                    console.print(f"  Auto-selected: {album.artist} — {album.title} ({album.source})")
+            elif isinstance(album, DirectId):
+                console.print(f"  Fetching {album.source}:{album.source_id}...")
+                album = fetch_album(album.source, album.source_id)
+                if not album or not album.tracks:
+                    console.print("[yellow]No album found for the specified ID. Using numbered tracks.[/yellow]")
+                    n = len(boundaries) + 1
+                    track_titles = [f"Track {i:02d}" for i in range(1, n + 1)]
+                    track_durations = [total_duration / n] * n
+                    track_artists = [""] * n
+                    album_artist = ""
+                    album_title = input_path.stem
+                    album = None
+
             if album is None:
                 console.print("[yellow]No album selected. Using numbered tracks.[/yellow]")
                 n = len(boundaries) + 1

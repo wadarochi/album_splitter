@@ -39,6 +39,12 @@ class AlbumScore:
     source_weight: float
     total_score: float
     flags: list[str] = field(default_factory=list)
+    year_match: bool = False
+    barcode_match: bool = False
+    catalog_match: bool = False
+    track_name_similarity: float = 0.0
+    country_hint: str | None = None
+    disambiguation: str | None = None
 
 
 def score_candidates(

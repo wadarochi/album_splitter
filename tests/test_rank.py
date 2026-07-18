@@ -91,3 +91,63 @@ class TestScoreCandidates:
 
         scores = [s.total_score for s in scored]
         assert scores == sorted(scores, reverse=True)
+
+
+class TestAlbumScoreDisambiguationFields:
+    def test_default_values(self):
+        from cue_finder.core.rank import AlbumScore
+        from cue_finder.core.search import AlbumInfo, TrackInfo
+        
+        album = AlbumInfo(
+            artist="S.H.E",
+            title="Play",
+            date="2007",
+            source="itunes",
+            source_id="1",
+            tracks=[TrackInfo(title="Track 1", duration_sec=200.0, artist="S.H.E")],
+        )
+        score = AlbumScore(
+            album=album,
+            text_tier=0,
+            count_delta=0,
+            duration_score=0.8,
+            fingerprint_hit=False,
+            source_weight=0.9,
+            total_score=0.75,
+        )
+        assert score.year_match is False
+        assert score.barcode_match is False
+        assert score.catalog_match is False
+        assert score.track_name_similarity == 0.0
+        assert score.country_hint is None
+        assert score.disambiguation is None
+
+    def test_custom_values(self):
+        from cue_finder.core.rank import AlbumScore
+        from cue_finder.core.search import AlbumInfo, TrackInfo
+        
+        album = AlbumInfo(
+            artist="S.H.E",
+            title="Play",
+            date="2007",
+            source="itunes",
+            source_id="1",
+            tracks=[TrackInfo(title="Track 1", duration_sec=200.0, artist="S.H.E")],
+        )
+        score = AlbumScore(
+            album=album,
+            text_tier=0,
+            count_delta=0,
+            duration_score=0.8,
+            fingerprint_hit=False,
+            source_weight=0.9,
+            total_score=0.75,
+            year_match=True,
+            barcode_match=True,
+            country_hint="TW",
+            disambiguation="Deluxe Edition",
+        )
+        assert score.year_match is True
+        assert score.barcode_match is True
+        assert score.country_hint == "TW"
+        assert score.disambiguation == "Deluxe Edition"

@@ -301,3 +301,30 @@ class TestSuggestDiscRanges:
         suggestions = _suggest_disc_ranges(17, 10)
         for _, start, end in suggestions:
             assert 1 <= start <= end <= 17
+
+
+class TestSearchRefinement:
+    def test_dataclass_has_query_field(self):
+        from cue_finder.core.interactive import SearchRefinement
+        sr = SearchRefinement(query="S.H.E Play 2007")
+        assert sr.query == "S.H.E Play 2007"
+
+    def test_dataclass_is_not_album_info(self):
+        from cue_finder.core.interactive import SearchRefinement
+        sr = SearchRefinement(query="test")
+        assert not hasattr(sr, "artist")
+        assert not hasattr(sr, "title")
+
+
+class TestDirectId:
+    def test_dataclass_has_source_and_id(self):
+        from cue_finder.core.interactive import DirectId
+        did = DirectId(source="netease", source_id="12345")
+        assert did.source == "netease"
+        assert did.source_id == "12345"
+
+    def test_dataclass_is_not_album_info(self):
+        from cue_finder.core.interactive import DirectId
+        did = DirectId(source="itunes", source_id="456")
+        assert not hasattr(did, "artist")
+        assert not hasattr(did, "title")
